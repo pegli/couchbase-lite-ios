@@ -58,7 +58,6 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
 @synthesize headers=_headers, OAuth=_OAuth, facebookEmailAddress=_facebookEmailAddress;
 @synthesize personaEmailAddress=_personaEmailAddress, customProperties=_customProperties;
 @synthesize running = _running, completedChangesCount=_completedChangesCount, changesCount=_changesCount, lastError=_lastError, status=_status;
-@synthesize propertiesTransformationBlock=_propertiesTransformationBlock;
 
 - (instancetype) initWithDatabase: (CBLDatabase*)database
                            remote: (NSURL*)remote
@@ -305,8 +304,10 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     }
 
     if (changed) {
-        LogTo(CBLReplication, @"%@: status=%d, completed=%u, total=%u (changed=%d)",
-              self, status, (unsigned)changesProcessed, (unsigned)changesTotal, changed);
+        static const char* kStatusNames[] = {"stopped", "offline", "idle", "active"};
+        LogTo(Sync, @"%@: %s, progress = %u / %u, err: %@",
+              self, kStatusNames[status], (unsigned)changesProcessed, (unsigned)changesTotal,
+              error.localizedDescription);
         [[NSNotificationCenter defaultCenter]
                         postNotificationName: kCBLReplicationChangeNotification object: self];
     }
@@ -353,7 +354,9 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
         repl.revisionBodyTransformationBlock = ^(CBL_Revision* rev) {
             NSDictionary* properties = rev.properties;
             NSDictionary* xformedProperties = xformer(properties);
-            if (xformedProperties != properties) {
+            if (xformedProperties == nil) {
+                rev = nil;
+            } else if (xformedProperties != properties) {
                 Assert(xformedProperties != nil);
                 AssertEqual(xformedProperties.cbl_id, properties.cbl_id);
                 AssertEqual(xformedProperties.cbl_rev, properties.cbl_rev);
@@ -408,18 +411,5 @@ NSString* const kCBLReplicationChangeNotification = @"CBLReplicationChange";
     }
 }
 
-
-#ifdef CBL_DEPRECATED
-- (bool) create_target  {return self.createTarget;}
-- (void) setCreate_target:(bool)create_target {self.createTarget = create_target;}
-- (NSDictionary*) query_params {return self.filterParams;}
-- (void) setQuery_params:(NSDictionary *)query_params {self.filterParams = query_params;}
-- (NSArray*) doc_ids    {return self.documentIDs;}
-- (void) setDoc_ids:(NSArray *)doc_ids {self.documentIDs = doc_ids;}
-- (CBLReplicationStatus) mode {return self.status;}
-- (NSError*) error      {return self.lastError;}
-- (unsigned) completed  {return self.completedChangesCount;}
-- (unsigned) total      {return self.changesCount;}
-#endif
 
 @end

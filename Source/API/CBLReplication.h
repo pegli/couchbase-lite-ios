@@ -19,11 +19,6 @@ typedef enum {
 } CBLReplicationStatus;
 
 
-/** A callback block for transforming revision bodies during replication.
-    See CBLReplication.propertiesTransformationBlock's documentation for details. */
-typedef NSDictionary *(^CBLPropertiesTransformationBlock)(NSDictionary *);
-
-
 /** A 'push' or 'pull' replication between a local and a remote database.
     Replications can be one-shot or continuous. */
 @interface CBLReplication : NSObject
@@ -169,16 +164,6 @@ typedef NSDictionary *(^CBLPropertiesTransformationBlock)(NSDictionary *);
 /** The total number of changes to be processed, if the task is active, else 0 (observable). */
 @property (nonatomic, readonly) unsigned changesCount;
 
-
-#ifdef CBL_DEPRECATED
-@property (nonatomic) bool create_target __attribute__((deprecated("renamed createTarget")));
-@property (nonatomic, copy) NSDictionary* query_params __attribute__((deprecated("renamed filterParams")));
-@property (copy) NSArray *doc_ids __attribute__((deprecated("renamed documentIDs")));
-@property (nonatomic, readonly) CBLReplicationStatus mode __attribute__((deprecated("renamed status")));
-@property (nonatomic, readonly, retain) NSError* error __attribute__((deprecated("renamed lastError")));
-@property (nonatomic, readonly) unsigned completed __attribute__((deprecated("renamed completedChangesCount")));
-@property (nonatomic, readonly) unsigned total __attribute__((deprecated("renamed changesCount")));
-#endif
 @end
 
 
@@ -186,8 +171,3 @@ typedef NSDictionary *(^CBLPropertiesTransformationBlock)(NSDictionary *);
     {status, running, error, completed, total}. It's often more convenient to observe this
     notification rather than observing each property individually. */
 extern NSString* const kCBLReplicationChangeNotification;
-
-
-#ifdef CBL_DEPRECATED
-typedef CBLReplicationStatus CBLReplicationMode __attribute__((deprecated("renamed CBLReplicationStatus")));
-#endif

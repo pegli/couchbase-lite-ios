@@ -252,8 +252,11 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 - (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist {
     CBLDocument* doc = (CBLDocument*) [_docCache resourceWithCacheKey: docID];
-    if (doc)
+    if (doc) {
+        if (mustExist && doc.currentRevision == nil)  // loads current revision from db
+            return nil;
         return doc;
+    }
     if (docID.length == 0)
         return nil;
     doc = [[CBLDocument alloc] initWithDatabase: self documentID: docID];
@@ -449,50 +452,6 @@ static NSString* makeLocalDocID(NSString* docID) {
     return nil;
 }
 
-
-#ifdef CBL_DEPRECATED
-- (CBLDocument*) untitledDocument {return [self createDocument];}
-- (void) clearDocumentCache {[self _clearDocumentCache];}
-- (CBLDocument*) cachedDocumentWithID: (NSString*)docID {
-    return [self _cachedDocumentWithID: docID];
-}
-- (NSDictionary*) getLocalDocumentWithID: (NSString*)localDocID {
-    return [self existingLocalDocumentWithID: localDocID];
-}
-- (CBLQuery*) queryAllDocuments {return [self createAllDocumentsQuery];}
-- (void) defineValidation: (NSString*)validationName asBlock: (CBLValidationBlock)validationBlock {
-    [self setValidationNamed: validationName asBlock: validationBlock];
-}
-- (void) defineFilter: (NSString*)filterName asBlock: (CBLFilterBlock)filterBlock {
-    [self setFilterNamed: filterName asBlock: filterBlock];
-}
-- (CBLReplication*) replicationToURL: (NSURL*)url {
-    return [self createPushReplication: url];
-}
-- (CBLReplication*) replicationFromURL: (NSURL*)url {
-    return [self createPullReplication: url];
-}
-- (CBLReplication*) pushToURL: (NSURL*)url {
-    return [self createPushReplication: url];
-}
-- (CBLReplication*) pullFromURL: (NSURL*)url {
-    return [self createPullReplication: url];
-}
-- (NSArray*) replicationsWithURL: (NSURL*)otherDbURL exclusively: (bool)exclusively {
-    if (exclusively) {
-        for (CBLReplication* repl in self.allReplications)
-            if (!$equal(repl.remoteURL, otherDbURL))
-                [repl stop];
-    }
-    CBLReplication* pull = [self existingReplicationWithURL: otherDbURL pull: YES];
-    if (!pull)
-        pull = [self createPullReplication: otherDbURL];
-    CBLReplication* push = [self existingReplicationWithURL: otherDbURL pull: NO];
-    if (!push)
-        push = [self createPushReplication: otherDbURL];
-    return (pull && push) ? @[pull, push] : nil;
-}
-#endif
 
 @end
 

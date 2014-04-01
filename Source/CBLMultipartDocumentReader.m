@@ -312,7 +312,7 @@
                                          error: NULL];
     if (![document isKindOfClass: [NSDictionary class]]) {
         Warn(@"%@: received unparseable JSON data '%@'",
-             self, [json my_UTF8ToString]);
+             self, ([json my_UTF8ToString] ?: json));
         _status = kCBLStatusUpstreamError;
         return NO;
     }

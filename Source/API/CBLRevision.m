@@ -144,11 +144,24 @@
 }
 
 
-- (instancetype) initWithDatabase: (CBLDatabase*)db revision: (CBL_Revision*)rev {
+- (instancetype) initWithDatabase: (CBLDatabase*)db
+                         revision: (CBL_Revision*)rev
+{
     CBLDocument* doc = [db documentWithID: rev.docID];
     return [self initWithDocument: doc revision: rev];
 }
 
+- (instancetype) initForValidationWithDatabase: (CBLDatabase*)db
+                                      revision: (CBL_Revision*)rev
+                              parentRevisionID: (NSString*)parentRevID
+{
+    self = [self initWithDatabase: db revision: rev];
+    if (self) {
+        _parentRevID = parentRevID.copy;
+        _checkedProperties = YES;
+    }
+    return self;
+}
 
 - (BOOL) isEqual: (id)object {
     if (object == self)
@@ -161,52 +174,59 @@
 
 @synthesize rev=_rev;
 
-- (NSString*) revisionID    {return _rev.revID;}
-- (BOOL) isDeletion          {return _rev.deleted;}
-- (BOOL) propertiesAvailable{return !_rev.missing;}
+- (NSString*) revisionID        {return _rev.revID;}
+- (BOOL) isDeletion             {return _rev.deleted;}
+- (BOOL) propertiesAvailable    {return !_rev.missing;}
 
 
 - (NSString*) parentRevisionID  {
-    return _parentRevID ?: [_document.database getParentRevision: _rev].revID;
+    return _parentRevID ?: [_document.database.storage getParentRevision: _rev].revID;
 }
 
 - (CBLSavedRevision*) parentRevision  {
     if (_parentRevID)
         return [_document revisionWithID: _parentRevID];
     CBLDocument* document = _document;
-    return [document revisionFromRev: [document.database getParentRevision: _rev]];
-}
-
-- (void) _setParentRevisionID: (NSString*)parentRevID {
-    _parentRevID = parentRevID.copy;
+    return [document revisionFromRev: [document.database.storage getParentRevision: _rev]];
 }
 
 
 - (bool) loadProperties {
     CBLStatus status;
-    CBL_Revision* rev = [self.database revisionByLoadingBody: _rev options: 0 status: &status];
+    CBL_Revision* rev = [self.database revisionByLoadingBody: _rev status: &status];
     if (!rev) {
         Warn(@"Couldn't load body/sequence of %@: %d", self, status);
         return false;
     }
     _rev = rev;
+#if DEBUG
+    NSDictionary* properties = rev.properties;
+    AssertEqual(properties[@"_id"], self.document.documentID);
+    AssertEqual(properties[@"_rev"], self.revisionID);
+    AssertEq([properties[@"_deleted"] boolValue], self.isDeletion);
+#endif
     return true;
 }
 
 
 - (SequenceNumber) sequence {
-    SequenceNumber sequence = _rev.sequence;
-    if (sequence == 0 && [self loadProperties])
-            sequence = _rev.sequence;
+    SequenceNumber sequence = 0;
+    if (_rev.sequenceIfKnown > 0 || [self loadProperties])
+        sequence = _rev.sequence;
     return sequence;
 }
 
 
 - (NSDictionary*) properties {
     NSDictionary* properties = _rev.properties;
-    if (!properties && !_checkedProperties) {
-        if ([self loadProperties])
+    if (!_checkedProperties) {
+        if (properties == nil) {
+            if ([self loadProperties])
+                properties = _rev.properties;
+        } else if (!properties.cbl_id) {
+            _rev = [_rev revisionByAddingBasicMetadata];
             properties = _rev.properties;
+        }
         _checkedProperties = YES;
     }
     return properties;
@@ -219,7 +239,7 @@
 
 - (NSArray*) getRevisionHistory: (NSError**)outError {
     NSMutableArray* history = $marray();
-    for (CBL_Revision* rev in [self.database getRevisionHistory: _rev]) {
+    for (CBL_Revision* rev in [self.database.storage getRevisionHistory: _rev]) {
         CBLSavedRevision* revision;
         if ($equal(rev.revID, _rev.revID))
             revision = self;
@@ -259,7 +279,7 @@
 
 
 
-#pragma mark - CBLNEWREVISION
+#pragma mark - CBLUNSAVEDREVISION
 
 
 @implementation CBLUnsavedRevision
@@ -269,6 +289,7 @@
 }
 
 @synthesize parentRevisionID=_parentRevID, properties=_properties;
+@dynamic isDeletion, userProperties;     // Necessary because this class redeclares them
 
 - (instancetype) initWithDocument: (CBLDocument*)doc parent: (CBLSavedRevision*)parent {
     Assert(doc != nil);
@@ -346,12 +367,14 @@
     [atts setValue: attachment forKey: name];
     _properties[@"_attachments"] = atts;
     attachment.name = name;
-    attachment.revision = self;
+    
+    // NOTE: Not setting the revision to the attachment object (attachment.revision = self) as
+    // [1] The UnsavedRevision object is not used during save operation
+    // [2] Setting the UnsavedRevision object here will cause the circular reference memory leak.
 }
 
 - (void) removeAttachmentNamed: (NSString*)name {
     [self _addAttachment: nil named: name];
 }
-
 
 @end

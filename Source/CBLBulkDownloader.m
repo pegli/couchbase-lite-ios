@@ -48,11 +48,10 @@
 {
     // Build up a JSON body describing what revisions we want:
     NSArray* keys = [revs my_map: ^(CBL_Revision* rev) {
-        BOOL hasAttachment;
-        NSArray* attsSince = [_db getPossibleAncestorRevisionIDs: rev
+        NSArray* attsSince = [_db.storage getPossibleAncestorRevisionIDs: rev
                                                            limit: kMaxNumberOfAttsSince
-                                                   hasAttachment: &hasAttachment];
-        if (!hasAttachment || attsSince.count == 0)
+                                                 onlyAttachments: YES];
+        if (!attsSince.count == 0)
             attsSince = nil;
         return $dict({@"id", rev.docID},
                      {@"rev", rev.revID},
@@ -87,6 +86,16 @@
 
 
 #pragma mark - URL CONNECTION CALLBACKS:
+
+
+- (BOOL) retry {
+    if (_docCount > 0) {
+        // Don't retry if we've already read any docs, because we'd get
+        // those docs again and confuse the replicator.
+        return NO;
+    }
+    return [super retry];
+}
 
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
@@ -158,6 +167,7 @@
     Assert(_docReader);
     if (![_docReader finish]) {
         [self cancelWithStatus: _docReader.status];
+        _docReader = nil;
         return NO;
     }
     ++_docCount;

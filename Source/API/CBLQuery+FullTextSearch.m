@@ -33,43 +33,46 @@ static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUI
 @end
 
 
-
-
 @implementation CBLFullTextQueryRow
 {
     UInt64 _fullTextID;
-    __weak NSString* _fullText;
-    NSArray* _matchOffsets;
-    NSString* _snippet;
+    NSMutableArray* _matchOffsets;
 }
 
-@synthesize snippet=_snippet;
 
 - (instancetype) initWithDocID: (NSString*)docID
                       sequence: (SequenceNumber)sequence
                     fullTextID: (UInt64)fullTextID
-                  matchOffsets: (NSString*)matchOffsets
                          value: (id)value
+                       storage: (id<CBL_QueryRowStorage>)storage
 {
-    self = [super initWithDocID: docID sequence: sequence key: $null value: value docProperties: nil];
+    self = [super initWithDocID: docID sequence: sequence key: $null value: value
+                  docRevision: nil storage: storage];
     if (self) {
         _fullTextID = fullTextID;
-        // Parse the offsets as a space-delimited list of numbers, into an NSArray.
-        // (See http://sqlite.org/fts3.html#section_4_1 )
-        _matchOffsets = [[matchOffsets componentsSeparatedByString: @" "] my_map:^id(NSString* str) {
-            return @([str integerValue]);
-        }];
+        _matchOffsets = [[NSMutableArray alloc] initWithCapacity: 4];
     }
     return self;
 }
 
+- (void) addTerm: (NSUInteger)term atRange: (NSRange)range {
+    [_matchOffsets addObject: @"?"]; //FIX
+    [_matchOffsets addObject: @(term)];
+    [_matchOffsets addObject: @(range.location)];
+    [_matchOffsets addObject: @(range.length)];
+}
+
+- (NSData*) fullTextUTF8Data {
+    return [self.storage fullTextForDocument: self.documentID
+                                    sequence: self.sequenceNumber
+                                  fullTextID: _fullTextID];
+}
+
 - (NSString*) fullText {
-    NSString* fullText = _fullText;
-    if (!fullText) {
-        fullText = [self.database _indexedTextWithID: _fullTextID];
-        _fullText = fullText;
-    }
-    return fullText;
+    NSData* data = self.fullTextUTF8Data;
+    if (!data)
+        return nil;
+    return [[NSString alloc] initWithData: data encoding: NSUTF8StringEncoding];
 }
 
 - (NSUInteger) matchCount {
@@ -83,38 +86,23 @@ static NSUInteger utf8BytesToChars(const void* bytes, NSUInteger byteStart, NSUI
 - (NSRange) textRangeOfMatch: (NSUInteger)matchNumber {
     NSUInteger byteStart  = [_matchOffsets[4*matchNumber + 2] unsignedIntegerValue];
     NSUInteger byteLength = [_matchOffsets[4*matchNumber + 3] unsignedIntegerValue];
-    NSData* rawText = [self.fullText dataUsingEncoding: NSUTF8StringEncoding];
+    NSData* rawText = self.fullTextUTF8Data;
     return NSMakeRange(utf8BytesToChars(rawText.bytes, 0, byteStart),
                        utf8BytesToChars(rawText.bytes, byteStart, byteStart + byteLength));
 }
 
 
-- (NSString*) snippetWithWordStart: (NSString*)wordStart
-                           wordEnd: (NSString*)wordEnd
-{
-    if (!_snippet)
-        return nil;
-    NSMutableString* snippet = [_snippet mutableCopy];
-    [snippet replaceOccurrencesOfString: @"\001" withString: wordStart
-                                options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
-    [snippet replaceOccurrencesOfString: @"\002" withString: wordEnd
-                                options:NSLiteralSearch range:NSMakeRange(0, snippet.length)];
-    return snippet;
-}
-
-
-// Override to add FTS result info
+// Overridden to add FTS result info
 - (NSDictionary*) asJSONDictionary {
     NSMutableDictionary* dict = [[super asJSONDictionary] mutableCopy];
     if (!dict[@"error"]) {
         [dict removeObjectForKey: @"key"];
-        if (_snippet)
-            dict[@"snippet"] = [self snippetWithWordStart: @"[" wordEnd: @"]"];
         if (_matchOffsets) {
             NSMutableArray* matches = [[NSMutableArray alloc] init];
             for (NSUInteger i = 0; i < _matchOffsets.count; i += 4) {
+                NSRange r = [self textRangeOfMatch: i/4];
                 [matches addObject: @{@"term": _matchOffsets[i+1],
-                                      @"range": @[_matchOffsets[i+2], _matchOffsets[i+3]]}];
+                                      @"range": @[@(r.location), @(r.length)]}];
             }
             dict[@"matches"] = matches;
         }

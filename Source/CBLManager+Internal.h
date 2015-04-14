@@ -11,7 +11,11 @@
 @class CBLDatabase, CBL_Replicator, CBL_Shared;
 
 
-@interface CBLManager (Internal)
+@interface CBLManager ()
+
+@property (copy, nonatomic) NSString* storageType;      // @"SQLite" (default) or @"ForestDB"
+
+- (NSString*) nameOfDatabaseAtPath: (NSString*)path;
 
 - (NSString*) pathForDatabaseNamed: (NSString*)name;
 

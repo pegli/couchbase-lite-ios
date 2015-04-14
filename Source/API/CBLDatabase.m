@@ -17,7 +17,6 @@
 #import "CBLDatabase.h"
 #import "CBLDatabase+Internal.h"
 #import "CBLDatabase+Insertion.h"
-#import "CBLDatabase+LocalDocs.h"
 #import "CBLDatabaseChange.h"
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
@@ -35,14 +34,11 @@
 
 
 // NOTE: This file contains mostly just public-API method implementations.
-// The lower-level stuff is in CBLDatabase.m, etc.
+// The lower-level stuff is in CBLDatabase+Internal.m, etc.
 
 
 // Size of document cache: max # of otherwise-unreferenced docs that will be kept in memory.
 #define kDocRetainLimit 50
-
-// Default value for maxRevTreeDepth, the max rev depth to preserve in a prune operation
-#define kDefaultMaxRevs 20
 
 NSString* const kCBLDatabaseChangeNotification = @"CBLDatabaseChange";
 
@@ -53,22 +49,20 @@ static id<CBLFilterCompiler> sFilterCompiler;
 @implementation CBLDatabase
 {
     CBLCache* _docCache;
-    CBLModelFactory* _modelFactory;  // used in category method in CBLModelFactory.m
-    NSMutableSet* _unsavedModelsMutable;   // All CBLModels that have unsaved changes
     NSMutableSet* _allReplications;
 }
 
 
 @synthesize manager=_manager, unsavedModelsMutable=_unsavedModelsMutable;
-@synthesize path=_path, name=_name, isOpen=_isOpen;
+@synthesize dir=_dir, name=_name, isOpen=_isOpen;
 
 
-- (instancetype) initWithPath: (NSString*)path
-                         name: (NSString*)name
-                      manager: (CBLManager*)manager
-                     readOnly: (BOOL)readOnly
+- (instancetype) initWithDir: (NSString*)dir
+                        name: (NSString*)name
+                     manager: (CBLManager*)manager
+                    readOnly: (BOOL)readOnly
 {
-    self = [self _initWithPath: path name: name manager: manager readOnly: readOnly];
+    self = [self _initWithDir: dir name: name manager: manager readOnly: readOnly];
     if (self) {
         _unsavedModelsMutable = [NSMutableSet set];
         _allReplications = [[NSMutableSet alloc] init];
@@ -83,8 +77,6 @@ static id<CBLFilterCompiler> sFilterCompiler;
                                                      name: UIApplicationDidEnterBackgroundNotification
                                                    object: nil];
 #endif
-        if (0)
-            _modelFactory = nil;  // appeases static analyzer
     }
     return self;
 }
@@ -92,10 +84,20 @@ static id<CBLFilterCompiler> sFilterCompiler;
 
 - (void)dealloc {
     if (_isOpen) {
-        //Warn(@"%@ dealloced without being closed first!", self);
-        [self close];
+        Assert(!_manager);
+        [self _close];
     }
     [[NSNotificationCenter defaultCenter] removeObserver: self];
+}
+
+
+- (NSUInteger) documentCount {
+    return _storage.documentCount;
+}
+
+
+- (SequenceNumber) lastSequenceNumber {
+    return _storage.lastSequence;
 }
 
 
@@ -103,7 +105,7 @@ static id<CBLFilterCompiler> sFilterCompiler;
     BOOL external = NO;
     for (CBLDatabaseChange* change in changes) {
         // Notify the corresponding instantiated CBLDocument object (if any):
-        [[self _cachedDocumentWithID: change.documentID] revisionAdded: change];
+        [[self _cachedDocumentWithID: change.documentID] revisionAdded: change notify: YES];
         if (change.source != nil)
             external = YES;
     }
@@ -114,17 +116,15 @@ static id<CBLFilterCompiler> sFilterCompiler;
     NSNotification* n = [NSNotification notificationWithName: kCBLDatabaseChangeNotification
                                                       object: self
                                                     userInfo: userInfo];
-    NSNotificationQueue* queue = [NSNotificationQueue defaultQueue];
-    [queue enqueueNotification: n
-                  postingStyle: NSPostASAP 
-                  coalesceMask: NSNotificationNoCoalescing
-                      forModes: @[NSRunLoopCommonModes]];
+    [self postNotification:n];
 }
 
 
 #if TARGET_OS_IPHONE
 - (void) appBackgrounding: (NSNotification*)n {
-    [self autosaveAllModels: nil];
+    [self doAsync: ^{
+        [self autosaveAllModels: nil];
+    }];
 }
 #endif
 
@@ -142,10 +142,14 @@ static void catchInBlock(void (^block)()) {
 
 
 - (void) doAsync: (void (^)())block {
+    block = ^{
+        if (_isOpen)
+            catchInBlock(block);
+    };
     if (_dispatchQueue)
-        dispatch_async(_dispatchQueue, ^{catchInBlock(block);});
+        dispatch_async(_dispatchQueue, block);
     else
-        MYOnThread(_thread, ^{catchInBlock(block);});
+        MYOnThreadInModes(_thread, CBL_RunloopModes, NO, block);
 }
 
 
@@ -153,23 +157,36 @@ static void catchInBlock(void (^block)()) {
     if (_dispatchQueue)
         dispatch_sync(_dispatchQueue, ^{catchInBlock(block);});
     else
-        MYOnThreadSynchronously(_thread, ^{catchInBlock(block);});
+        MYOnThreadInModes(_thread, CBL_RunloopModes, YES, ^{catchInBlock(block);});
 }
 
 
 - (void) doAsyncAfterDelay: (NSTimeInterval)delay block: (void (^)())block {
+    block = ^{
+        if (_isOpen)
+            catchInBlock(block);
+    };
     if (_dispatchQueue) {
         dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC));
         dispatch_after(popTime, _dispatchQueue, block);
     } else {
         //FIX: This schedules on the _current_ thread, not _thread!
-        MYAfterDelay(delay, ^{catchInBlock(block);});
+        MYAfterDelay(delay, block);
     }
 }
 
 
+- (BOOL) waitFor: (BOOL (^)())block {
+    if (_dispatchQueue) {
+        Warn(@"-[CBLDatabase waitFor:] cannot be used with dispatch queues, only runloops");
+        return NO;
+    }
+    return MYWaitFor(CBL_PrivateRunloopMode, block);
+}
+
+
 - (BOOL) inTransaction: (BOOL(^)(void))block {
-    return 200 == [self _inTransaction: ^CBLStatus {
+    return 200 == [_storage inTransaction: ^CBLStatus {
         return block() ? 200 : 999;
     }];
 }
@@ -180,72 +197,61 @@ static void catchInBlock(void (^block)()) {
 }
 
 
-- (BOOL) close {
-    (void)[self saveAllModels: NULL];  // ?? Or should I return NO if this fails?
-
-    if (![self closeInternal])
+- (BOOL) close: (NSError**)outError {
+    if (![self saveAllModels: outError])
         return NO;
-
-    [self _clearDocumentCache];
-    _modelFactory = nil;
-    return YES;
-}
-
-
-- (BOOL) closeForDeletion {
-    // There is no need to save any changes!
-    for (CBLModel* model in _unsavedModelsMutable.copy)
-        model.needsSave = false;
-    _unsavedModelsMutable = nil;
-    [self close];
-    [_manager _forgetDatabase: self];
+    for (CBLReplication* repl in self.allReplications)
+        [repl stop];
+    [self _close];
     return YES;
 }
 
 
 - (BOOL) deleteDatabase: (NSError**)outError {
-    LogTo(CBLDatabase, @"Deleting %@", _path);
+    LogTo(CBLDatabase, @"Deleting %@", _dir);
     [[NSNotificationCenter defaultCenter] postNotificationName: CBL_DatabaseWillBeDeletedNotification
                                                         object: self];
-    if (_isOpen && ![self closeForDeletion])
-        return NO;
-    [_manager _forgetDatabase: self];
-    [[NSNotificationCenter defaultCenter] removeObserver: self];
+    [self _close];
+
+    // Wait for all threads to close this database file:
+    [_manager.shared forgetDatabaseNamed: _name];
+
     if (!self.exists) {
         return YES;
     }
-    return [[self class] deleteDatabaseFilesAtPath: _path error: outError];
+    return [[self class] deleteDatabaseFilesAtPath: _dir error: outError];
 }
 
 
 - (BOOL) compact: (NSError**)outError {
-    NSUInteger pruned;
-    CBLStatus status = [self pruneRevsToMaxDepth: 0 numberPruned: &pruned];
-    if (status == kCBLStatusOK)
-        status = [self compact];
-    
-    if (CBLStatusIsError(status)) {
-        if (outError)
-            *outError = CBLStatusToNSError(status, nil);
-        return NO;
-    }
-    return YES;
+    //FIX:
+//    CBLStatus status = [_storage inTransaction: ^CBLStatus {
+        // Do this in a transaction because garbageCollectAttachments expects the database to be
+        // freshly compacted (i.e. only current revisions have bodies), and it could delete new
+        // attachments added while it's working. So lock out other writers for the duration.
+    return [_storage compact: outError] && [self garbageCollectAttachments: outError];
+//    }];
+//    return !CBLStatusIsError(status);
 }
 
 - (NSUInteger) maxRevTreeDepth {
-    return [[self infoForKey: @"max_revs"] intValue] ?: kDefaultMaxRevs;
+    return _storage.maxRevTreeDepth;
 }
 
 - (void) setMaxRevTreeDepth: (NSUInteger)maxRevs {
-    [self setInfo: $sprintf(@"%lu", (unsigned long)maxRevs) forKey: @"max_revs"];
-    // This property is looked up by pruneRevsToMaxDepth:
+    if (maxRevs == 0)
+        maxRevs = kDefaultMaxRevs;
+    if (maxRevs != _storage.maxRevTreeDepth) {
+        _storage.maxRevTreeDepth = (unsigned)maxRevs;
+        [_storage setInfo: $sprintf(@"%lu", (unsigned long)maxRevs) forKey: @"max_revs"];
+    }
 }
 
 
 - (BOOL) replaceUUIDs: (NSError**)outError {
-    CBLStatus status = [self setInfo: CBLCreateUUID() forKey: @"publicUUID"];
+    CBLStatus status = [_storage setInfo: CBLCreateUUID() forKey: @"publicUUID"];
     if (status == kCBLStatusOK)
-        status = [self setInfo: CBLCreateUUID() forKey: @"privateUUID"];
+        status = [_storage setInfo: CBLCreateUUID() forKey: @"privateUUID"];
     if (status == kCBLStatusOK)
         return YES;
 
@@ -258,7 +264,7 @@ static void catchInBlock(void (^block)()) {
 #pragma mark - DOCUMENTS:
 
 
-- (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist {
+- (CBLDocument*) documentWithID: (NSString*)docID mustExist: (BOOL)mustExist isNew: (BOOL)isNew {
     CBLDocument* doc = (CBLDocument*) [_docCache resourceWithCacheKey: docID];
     if (doc) {
         if (mustExist && doc.currentRevision == nil)  // loads current revision from db
@@ -267,7 +273,9 @@ static void catchInBlock(void (^block)()) {
     }
     if (docID.length == 0)
         return nil;
-    doc = [[CBLDocument alloc] initWithDatabase: self documentID: docID];
+    doc = [[CBLDocument alloc] initWithDatabase: self
+                                     documentID: docID
+                                         exists: !isNew];
     if (!doc)
         return nil;
     if (mustExist && doc.currentRevision == nil)  // loads current revision from db
@@ -280,24 +288,24 @@ static void catchInBlock(void (^block)()) {
 
 
 - (CBLDocument*) documentWithID: (NSString*)docID {
-    return [self documentWithID: docID mustExist: NO];
+    return [self documentWithID: docID mustExist: NO isNew: NO];
 }
 
 - (CBLDocument*) existingDocumentWithID: (NSString*)docID {
-    return [self documentWithID: docID mustExist: YES];
+    return [self documentWithID: docID mustExist: YES isNew: NO];
 }
 
 - (CBLDocument*) objectForKeyedSubscript: (NSString*)key {
-    return [self documentWithID: key mustExist: NO];
+    return [self documentWithID: key mustExist: NO isNew: NO];
 }
 
 - (CBLDocument*) createDocument {
-    return [self documentWithID: [[self class] generateDocumentID] mustExist: NO];
+    return [self documentWithID: [[self class] generateDocumentID] mustExist: NO isNew: YES];
 }
 
 
 - (CBLDocument*) _cachedDocumentWithID: (NSString*)docID {
-    return (CBLDocument*) [_docCache resourceWithCacheKey: docID];
+    return (CBLDocument*) [_docCache resourceWithCacheKeyDontRecache: docID];
 }
 
 - (void) _clearDocumentCache {
@@ -314,17 +322,13 @@ static void catchInBlock(void (^block)()) {
 }
 
 
-// Appease the compiler; these are actually implemented in CBLDatabase+Internal.m
-@dynamic documentCount, lastSequenceNumber;
-
-
 static NSString* makeLocalDocID(NSString* docID) {
     return [@"_local/" stringByAppendingString: docID];
 }
 
 
 - (NSDictionary*) existingLocalDocumentWithID: (NSString*)localDocID {
-    return [self getLocalDocumentWithID: makeLocalDocID(localDocID) revisionID: nil].properties;
+    return [_storage getLocalDocumentWithID: makeLocalDocID(localDocID) revisionID: nil].properties;
 }
 
 - (BOOL) putLocalDocument: (NSDictionary*)properties
@@ -332,24 +336,17 @@ static NSString* makeLocalDocID(NSString* docID) {
                     error: (NSError**)outError
 {
     localDocID = makeLocalDocID(localDocID);
-    __block CBLStatus status;
-    BOOL ok = [self inTransaction: ^BOOL {
-        // The lower-level local docs API has MVCC and requires the matching prior revision ID.
-        // So first get the document to look up its current rev ID:
-        CBL_Revision* prevRev = [self getLocalDocumentWithID: localDocID revisionID: nil];
-        if (!prevRev && !properties) {
-            status = kCBLStatusNotFound;
-            return NO;
-        }
-        CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: localDocID
-                                                                        revID: nil
-                                                                      deleted: (properties == nil)];
-        if (properties)
-            rev.properties = properties;
-        // Now update the doc (or delete it, if properties is nil):
-        return [self putLocalRevision: rev prevRevisionID: prevRev.revID status: &status] != nil;
-    }];
-    
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: localDocID
+                                                                    revID: nil
+                                                                  deleted: (properties == nil)];
+    if (properties)
+        rev.properties = properties;
+    // Now update the doc (or delete it, if properties is nil):
+    CBLStatus status;
+    BOOL ok = [_storage putLocalRevision: rev
+                          prevRevisionID: nil
+                                obeyMVCC: NO
+                                  status: &status] != nil;
     if (!ok && outError)
         *outError = CBLStatusToNSError(status, nil);
     return ok;
@@ -377,10 +374,7 @@ static NSString* makeLocalDocID(NSString* docID) {
     CBLView* view = _views[name];
     if (view)
         return view;
-    view = [[CBLView alloc] initWithDatabase: self name: name];
-    if (!view.viewID)
-        return nil;
-    return [self registerView: view];
+    return [self registerView: [[CBLView alloc] initWithDatabase: self name: name create: NO]];
 }
 
 
@@ -388,7 +382,7 @@ static NSString* makeLocalDocID(NSString* docID) {
     CBLView* view = _views[name];
     if (view)
         return view;
-    return [self registerView: [[CBLView alloc] initWithDatabase: self name: name]];
+    return [self registerView: [[CBLView alloc] initWithDatabase: self name: name create: YES]];
 }
 
 

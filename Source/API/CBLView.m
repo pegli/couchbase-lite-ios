@@ -14,39 +14,92 @@
 //  and limitations under the License.
 
 #import "CouchbaseLitePrivate.h"
+#import "CBL_ViewStorage.h"
 #import "CBLView+Internal.h"
+#import "CBLSpecialKey.h"
 #import "CBL_Shared.h"
 #import "CBLInternal.h"
-#import "CBLCollateJSON.h"
-#import "CBLCanonicalJSON.h"
+#import "CBJSONEncoder.h"
 #import "CBLMisc.h"
+#import "ExceptionUtils.h"
 
-#import "FMDatabase.h"
-#import "FMDatabaseAdditions.h"
-#import "FMResultSet.h"
 
+NSString* const kCBLViewChangeNotification = @"CBLViewChange";
+
+
+// GROUP_VIEWS_BY_DEFAULT alters the behavior of -viewsInGroup and thus which views will be
+// re-indexed together. If it's defined, all views with no "/" in the name are treated as a single
+// group and will be re-indexed together. If it's not defined, such views aren't in any group
+// and will be re-indexed only individually. (The latter matches the CBL 1.0 behavior and
+// avoids unexpected slowdowns if an app suddenly has all its views re-index at once.)
+#undef GROUP_VIEWS_BY_DEFAULT
+
+
+@implementation CBLQueryOptions
+
+@synthesize startKey, endKey, startKeyDocID, endKeyDocID, keys, filter, fullTextQuery;
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        limit = kCBLQueryOptionsDefaultLimit;
+        inclusiveStart = YES;
+        inclusiveEnd = YES;
+        fullTextRanking = YES;
+        // everything else will default to nil/0/NO
+    }
+    return self;
+}
+
+@end
+
+
+
+#pragma mark -
 
 @implementation CBLView
 
 
-- (instancetype) initWithDatabase: (CBLDatabase*)db name: (NSString*)name {
+- (instancetype) initWithDatabase: (CBLDatabase*)db name: (NSString*)name create: (BOOL)create {
     Assert(db);
     Assert(name.length);
     self = [super init];
     if (self) {
+        _storage = [db.storage viewStorageNamed: name create: create];
+        if (!_storage)
+            return nil;
+        _storage.delegate = self;
         _weakDB = db;
         _name = [name copy];
-        _viewID = -1;  // means 'unknown'
-        _mapContentOptions = kCBLIncludeLocalSeq;
-        if (0) { // appease static analyzer
-            _collation = 0;
-        }
     }
     return self;
 }
 
 
-@synthesize name=_name;
+@synthesize name=_name, storage=_storage;
+
+
+- (NSString*) description {
+    return [NSString stringWithFormat: @"%@[%@/%@]", self.class, _weakDB.name, _name];
+}
+
+
+
+#if DEBUG
+- (void) setCollation: (CBLViewCollation)collation {
+    _collation = collation;
+}
+
+// for unit tests only
+- (void) forgetMapBlock {
+    CBLDatabase* db = _weakDB;
+    CBL_Shared* shared = db.shared;
+    [shared setValue: nil
+             forType: @"map" name: _name inDatabaseNamed: db.name];
+    [shared setValue: nil
+             forType: @"reduce" name: _name inDatabaseNamed: db.name];
+}
+#endif
 
 
 - (CBLDatabase*) database {
@@ -54,21 +107,39 @@
 }
 
 
-- (int) viewID {
-    if (_viewID < 0)
-        _viewID = [_weakDB.fmdb intForQuery: @"SELECT view_id FROM views WHERE name=?", _name];
-    return _viewID;
+- (void) close {
+    [_storage close];
+    _storage = nil;
+    _weakDB = nil;
 }
 
 
-- (SequenceNumber) lastSequenceIndexed {
-    return [_weakDB.fmdb longLongForQuery: @"SELECT lastSequence FROM views WHERE name=?", _name];
+- (void) deleteIndex {
+    [_storage deleteIndex];
 }
 
 
-- (CBLMapBlock) mapBlock {
+- (void) deleteView {
+    [_storage deleteView];
+    [_weakDB forgetViewNamed: _name];
+    [self close];
+}
+
+
+#pragma mark - CONFIGURATION:
+
+
+- (CBLMapBlock) registeredMapBlock {
     CBLDatabase* db = _weakDB;
     return [db.shared valueForType: @"map" name: _name inDatabaseNamed: db.name];
+}
+
+- (CBLMapBlock) mapBlock {
+    CBLMapBlock map = self.registeredMapBlock;
+    if (!map)
+        if ([self compileFromDesignDoc] == kCBLStatusOK)
+            map = self.registeredMapBlock;
+    return map;
 }
 
 - (CBLReduceBlock) reduceBlock {
@@ -76,6 +147,10 @@
     return [db.shared valueForType: @"reduce" name: _name inDatabaseNamed: db.name];
 }
 
+- (NSString*) mapVersion {
+    CBLDatabase* db = _weakDB;
+    return [db.shared valueForType: @"mapVersion" name: _name inDatabaseNamed: db.name];
+}
 
 - (BOOL) setMapBlock: (CBLMapBlock)mapBlock
          reduceBlock: (CBLReduceBlock)reduceBlock
@@ -84,29 +159,22 @@
     Assert(mapBlock);
     Assert(version);
 
+    BOOL changed = ![version isEqualToString: self.mapVersion];
+
     CBLDatabase* db = _weakDB;
     CBL_Shared* shared = db.shared;
     [shared setValue: [mapBlock copy]
              forType: @"map" name: _name inDatabaseNamed: db.name];
+    [shared setValue: version
+             forType: @"mapVersion" name: _name inDatabaseNamed: db.name];
     [shared setValue: [reduceBlock copy]
              forType: @"reduce" name: _name inDatabaseNamed: db.name];
-
-    if (![db open: nil])
-        return NO;
-
-    // Update the version column in the db. This is a little weird looking because we want to
-    // avoid modifying the db if the version didn't change, and because the row might not exist yet.
-    CBL_FMDatabase* fmdb = db.fmdb;
-    if (![fmdb executeUpdate: @"INSERT OR IGNORE INTO views (name, version) VALUES (?, ?)", 
-                              _name, version])
-        return NO;
-    if (fmdb.changes)
-        return YES;     // created new view
-    if (![fmdb executeUpdate: @"UPDATE views SET version=?, lastSequence=0 "
-                               "WHERE name=? AND version!=?", 
-                              version, _name, version])
-        return NO;
-    return (fmdb.changes > 0);
+    if (changed) {
+        [_storage setVersion: version];
+        // update any live queries that might be listening to this view, now that it has changed
+        [self postPublicChangeNotification];
+    }
+    return changed;
 }
 
 
@@ -115,51 +183,18 @@
 }
 
 
-- (BOOL) stale {
-    return self.lastSequenceIndexed < _weakDB.lastSequenceNumber;
-}
-
-
-- (void) deleteIndex {
-    if (self.viewID <= 0)
-        return;
+- (NSString*) documentType {
     CBLDatabase* db = _weakDB;
-    CBLStatus status = [db _inTransaction: ^CBLStatus {
-        if ([db.fmdb executeUpdate: @"DELETE FROM maps WHERE view_id=?",
-                                     @(_viewID)]) {
-            [db.fmdb executeUpdate: @"UPDATE views SET lastsequence=0 WHERE view_id=?",
-                                     @(_viewID)];
-        }
-        return db.lastDbStatus;
-    }];
-    if (CBLStatusIsError(status))
-        Warn(@"Error status %d removing index of %@", status, self);
+    return [db.shared valueForType: @"docType" name: _name inDatabaseNamed: db.name];
+}
+
+- (void) setDocumentType: (NSString*)type {
+    CBLDatabase* db = _weakDB;
+    [db.shared setValue: type forType: @"docType" name: _name inDatabaseNamed: db.name];
 }
 
 
-- (void) deleteView {
-    [_weakDB deleteViewNamed: _name];
-    _viewID = 0;
-}
-
-
-- (void) databaseClosing {
-    _weakDB = nil;
-    _viewID = 0;
-}
-
-
-- (CBLQuery*) createQuery {
-    return [[CBLQuery alloc] initWithDatabase: self.database view: self];
-}
-
-
-+ (NSNumber*) totalValues: (NSArray*)values {
-    double total = 0;
-    for (NSNumber* value in values)
-        total += value.doubleValue;
-    return @(total);
-}
+#pragma mark - COMPILATION:
 
 
 static id<CBLViewCompiler> sCompiler;
@@ -171,6 +206,177 @@ static id<CBLViewCompiler> sCompiler;
 
 + (id<CBLViewCompiler>) compiler {
     return sCompiler;
+}
+
+
+- (CBLStatus) compileFromDesignDoc {
+    if (self.registeredMapBlock != nil)
+        return kCBLStatusOK;
+
+    // see if there's a design doc with a CouchDB-style view definition we can compile:
+    NSString* language;
+    NSDictionary* viewProps = $castIf(NSDictionary, [_weakDB getDesignDocFunction: self.name
+                                                                              key: @"views"
+                                                                         language: &language]);
+    if (!viewProps)
+        return kCBLStatusNotFound;
+    LogTo(View, @"%@: Attempting to compile %@ from design doc", self.name, language);
+    if (![CBLView compiler])
+        return kCBLStatusNotImplemented;
+    return [self compileFromProperties: viewProps language: language];
+}
+
+
+- (CBLStatus) compileFromProperties: (NSDictionary*)viewProps language: (NSString*)language {
+    if (!language)
+        language = @"javascript";
+    NSString* mapSource = viewProps[@"map"];
+    if (!mapSource)
+        return kCBLStatusNotFound;
+    CBLMapBlock mapBlock = [[CBLView compiler] compileMapFunction: mapSource language: language];
+    if (!mapBlock) {
+        Warn(@"View %@ could not compile %@ map fn: %@", _name, language, mapSource);
+        return kCBLStatusCallbackError;
+    }
+    NSString* reduceSource = viewProps[@"reduce"];
+    CBLReduceBlock reduceBlock = NULL;
+    if (reduceSource) {
+        reduceBlock = [[CBLView compiler] compileReduceFunction: reduceSource language: language];
+        if (!reduceBlock) {
+            Warn(@"View %@ could not compile %@ map fn: %@", _name, language, reduceSource);
+            return kCBLStatusCallbackError;
+        }
+    }
+
+    // Version string is based on a digest of the properties:
+    NSError* error;
+    NSString* version = CBLHexSHA1Digest([CBJSONEncoder canonicalEncoding: viewProps error: &error]);
+    [self setMapBlock: mapBlock reduceBlock: reduceBlock version: version];
+
+    self.documentType = $castIf(NSString, viewProps[@"documentType"]);
+    NSDictionary* options = $castIf(NSDictionary, viewProps[@"options"]);
+    _collation = ($equal(options[@"collation"], @"raw")) ? kCBLViewCollationRaw
+                                                         : kCBLViewCollationUnicode;
+    return kCBLStatusOK;
+}
+
+
+#pragma mark - INDEXING:
+
+
+- (NSArray*) viewsInGroup {
+    int (^filter)(CBLView* view);
+    NSRange slash = [_name rangeOfString: @"/"];
+    if (slash.length > 0) {
+        // Return all the views whose name starts with the same prefix before the slash:
+        NSString* prefix = [_name substringToIndex: NSMaxRange(slash)];
+        filter = ^int(CBLView* view) {
+            return [view.name hasPrefix: prefix];
+        };
+    } else {
+#ifdef GROUP_VIEWS_BY_DEFAULT
+        // Return all the views that don't have a slash in their names:
+        filter = ^int(CBLView* view) {
+            return [view.name rangeOfString: @"/"].length == 0;
+        };
+#else
+        // Without GROUP_VIEWS_BY_DEFAULT, views with no "/" in the name aren't in any group:
+        return @[self];
+#endif
+    }
+    return [_weakDB.allViews my_filter: filter];
+}
+
+
+/** Updates the view's index, if necessary. (If no changes needed, returns kCBLStatusNotModified.)*/
+- (CBLStatus) updateIndex {
+    return [self updateIndexes: self.viewsInGroup];
+}
+
+- (CBLStatus) updateIndexAlone {
+    return [self updateIndexes: @[self]];
+}
+
+- (CBLStatus) updateIndexes: (NSArray*)views {
+    NSArray* storages = [views my_map:^id(CBLView* view) {
+        return view.storage;
+    }];
+    return [_storage updateIndexes: storages];
+}
+
+- (void) postPublicChangeNotification {
+    // Post the public kCBLViewChangeNotification:
+    NSNotification* notification = [NSNotification notificationWithName: kCBLViewChangeNotification
+                                                                 object: self
+                                                               userInfo: nil];
+    [_weakDB postNotification:notification];
+}
+
++ (NSNumber*) totalValues: (NSArray*)values {
+    double total = 0;
+    for (NSNumber* value in values)
+        total += value.doubleValue;
+    return @(total);
+}
+
+
+#pragma mark - QUERYING:
+
+
+- (NSUInteger) totalRows {
+    return _storage.totalRows;
+}
+
+
+- (SequenceNumber) lastSequenceIndexed {
+    return _storage.lastSequenceIndexed;
+}
+
+
+- (SequenceNumber) lastSequenceChangedAt {
+    return _storage.lastSequenceChangedAt;
+}
+
+
+- (BOOL) stale {
+    return self.lastSequenceIndexed < _weakDB.lastSequenceNumber;
+}
+
+
+- (CBLQuery*) createQuery {
+    return [[CBLQuery alloc] initWithDatabase: self.database view: self];
+}
+
+
+/** Main internal call to query a view. */
+- (CBLQueryIteratorBlock) _queryWithOptions: (CBLQueryOptions*)options
+                                     status: (CBLStatus*)outStatus
+{
+    if (!options)
+        options = [CBLQueryOptions new];
+    CBLQueryIteratorBlock iterator;
+    if (options.fullTextQuery) {
+        iterator = [_storage fullTextQueryWithOptions: options status: outStatus];
+    } else if ([self groupOrReduceWithOptions: options])
+        iterator = [_storage reducedQueryWithOptions: options status: outStatus];
+    else
+        iterator = [_storage regularQueryWithOptions: options status: outStatus];
+    if (iterator)
+        LogTo(Query, @"Query %@: Returning iterator", _name);
+    else
+        LogTo(Query, @"Query %@: Failed with status %d", _name, *outStatus);
+    return iterator;
+}
+
+
+// Should this query be run as grouped/reduced?
+- (BOOL) groupOrReduceWithOptions: (CBLQueryOptions*) options {
+    if (options->group || options->groupLevel > 0)
+        return YES;
+    else if (options->reduceSpecified)
+        return options->reduce;
+    else
+        return (self.reduceBlock != nil); // Reduce defaults to true iff there's a reduce block
 }
 
 

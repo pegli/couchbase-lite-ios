@@ -8,9 +8,18 @@
 
 #import "MYDynamicObject.h"
 #import "CBLDocument.h"
-@class CBLAttachment, CBLDatabase, CBLDocument;
+
+#if __has_feature(nullability) // Xcode 6.3+
+#pragma clang assume_nonnull begin
+#else
+#define nullable
+#define __nullable
+#endif
+
+@class CBLAttachment, CBLDatabase;
 
 
+NS_REQUIRES_PROPERTY_DEFINITIONS  // Don't let compiler auto-synthesize properties in subclasses
 /** Generic model class for CouchbaseLite documents.
     There's a 1::1 mapping between these and CBLDocuments; call +modelForDocument: to get (or create) a model object for a document, and .document to get the document of a model.
     You should subclass this and declare properties in the subclass's @@interface. As with NSManagedObject, you don't need to implement their accessor methods or declare instance variables; simply note them as '@@dynamic' in the class @@implementation. The property value will automatically be fetched from or stored to the document, using the same name.
@@ -24,24 +33,19 @@
     If the CBLDocument already has an associated model, it's returned. Otherwise a new one is instantiated.
     If you call this on CBLModel itself, it'll delegate to the CBLModelFactory to decide what class to instantiate; this lets you map different classes to different "type" property values, for instance.
     If you call this method on a CBLModel subclass, it will always instantiate an instance of that class; e.g. [MyWidgetModel modelForDocument: doc] always creates a MyWidgetModel. */
-+ (instancetype) modelForDocument: (CBLDocument*)document               __attribute__((nonnull));
++ (instancetype) modelForDocument: (CBLDocument*)document;
 
-/** Creates a new "untitled" model with a new unsaved document.
-    The document won't be written to the database until -save is called. */
-- (instancetype) initWithNewDocumentInDatabase: (CBLDatabase*)database  __attribute__((nonnull));
-
-/** Creates a new "untitled" model object with no document or database at all yet.
-    Setting its .database property will cause it to create a CBLDocument.
-    (This method is mostly here so that NSController objects can create CBLModels.) */
-- (instancetype) init;
+/** Returns a new "untitled" CBLModel with a new unsaved document.
+ The document won't be written to the database until -save is called. */
++ (instancetype) modelForNewDocumentInDatabase: (CBLDatabase*)database;
 
 /** The document this item is associated with. Will be nil if it's new and unsaved. */
-@property (readonly, retain) CBLDocument* document;
+@property (readonly, strong, nullable) CBLDocument* document;
 
 /** The database the item's document belongs to.
     Setting this property will assign the item to a database, creating a document.
     Setting it to nil will delete its document from its database. */
-@property (retain) CBLDatabase* database;
+@property (retain, nullable) CBLDatabase* database;
 
 /** Is this model new, never before saved? */
 @property (readonly) bool isNew;
@@ -95,20 +99,36 @@
 
 /** Gets a property by name.
     You can use this for document properties that you haven't added @@property declarations for. */
-- (id) getValueOfProperty: (NSString*)property                          __attribute__((nonnull));
+- (nullable id) getValueOfProperty: (NSString*)property;
 
 /** Sets a property by name.
     You can use this for document properties that you haven't added @@property declarations for. */
-- (BOOL) setValue: (id)value
-       ofProperty: (NSString*)property                                  __attribute__((nonnull(2)));
+- (BOOL) setValue: (nullable id)value
+       ofProperty: (NSString*)property;
+
+
+/** Follows an _inverse_ relationship: returns the other models in the database that have a
+    property named `inverseProperty` that points to this object. For example, if model class
+    ListItem has a property 'list' that's a relation to a List model, then calling this method
+    on a List instance, with relation 'list', will return all the ListItems that refer to this List.
+
+    Specifically, what this does is run a CBLQuery that finds documents whose `relation`
+    property value is equal to the document ID of the receiver. (And if `fromClass` is given,
+    it's restricted to documents whose `type` property is one of the ones mapped to `fromClass`
+    in the CBLModelFactory.)
+    @param relation  The property name to look at
+    @param fromClass  (Optional) The CBLModel subclass to restrict the search to.
+    @return  An array of model objects found, or nil on error. */
+- (NSArray*) findInverseOfRelation: (NSString*)relation
+                         fromClass: (nullable Class)fromClass;
 
 
 /** The names of all attachments (array of strings).
     This reflects unsaved changes made by creating or deleting attachments. */
-@property (readonly) NSArray* attachmentNames;
+@property (readonly, nullable) NSArray* attachmentNames;
 
 /** Looks up the attachment with the given name (without fetching its contents). */
-- (CBLAttachment*) attachmentNamed: (NSString*)name                     __attribute__((nonnull));
+- (nullable CBLAttachment*) attachmentNamed: (NSString*)name;
 
 /** Creates, updates or deletes an attachment.
     The attachment data will be written to the database when the model is saved.
@@ -118,7 +138,7 @@
                     name will be deleted. */
 - (void) setAttachmentNamed: (NSString*)name
             withContentType: (NSString*)mimeType
-                    content: (NSData*)content                           __attribute__((nonnull));
+                    content: (NSData*)content;
 
 /** Creates, updates or deletes an attachment whose body comes from a file.
     (The method takes a URL, but it must be a "file:" URL. Remote resources are not supported.)
@@ -131,18 +151,20 @@
                      If this is nil, any existing attachment with this name will be deleted.*/
 - (void) setAttachmentNamed: (NSString*)name
             withContentType: (NSString*)mimeType
-                 contentURL: (NSURL*)fileURL                            __attribute__((nonnull));
+                 contentURL: (NSURL*)fileURL;
 
 /** Deletes (in memory) any existing attachment with the given name.
     The attachment will be deleted from the database at the same time as property changes are saved. */
-- (void) removeAttachmentNamed: (NSString*)name                         __attribute__((nonnull));
+- (void) removeAttachmentNamed: (NSString*)name;
 
 
 #pragma mark - PROTECTED (FOR SUBCLASSES TO OVERRIDE)
 
-/** Designated initializer. Do not call directly except from subclass initializers; to create a new instance call +modelForDocument: instead.
-    @param document  The document. Nil if this is created new (-init was called). */
-- (instancetype) initWithDocument: (CBLDocument*)document;
+
+/* Called when the model's initializer is called when the model object is created. You should override this if you need to initialize
+   any ivars or perform custom initialization when the model object is created.
+ */
+- (void)awakeFromInitializer;
 
 /** The document ID to use when creating a new document.
     Default is nil, which means to assign no ID (the server will assign one). */
@@ -162,7 +184,7 @@
 
 /** Called while saving a document, before building the new revision's dictionary.
     This method can modify property values if it wants to. */
-- (void) willSave: (NSSet*)changedPropertyNames;
+- (void) willSave: (nullable NSSet*)changedPropertyNames;
 
 /** If you want properties to be saved in the document when it's deleted (in addition to the required "_deleted":true) override this method to return those properties.
     This is called by -deleteDocument:. The default implementation returns {"_deleted":true}. */
@@ -180,7 +202,27 @@
  
     In general you'll find it easier to implement the '+propertyItemClass' method(s) rather
     than overriding this one. */
-+ (Class) itemClassForArrayProperty: (NSString*)property;
++ (nullable Class) itemClassForArrayProperty: (NSString*)property;
+
+/** General method for declaring the that an array-of-models-valued property is a computed inverse
+    of a relation from another class.
+    Given the property name, the override should return the name of the relation property in the
+    item class (the one returned by +itemClassForArrayProperty:). If it returns nil, then this
+    property will be interpreted as an explicit JSON property whose value is an array of strings
+    corresponding to the other models.
+ 
+    The default implementation of this method checks for the existence of a class method with
+    selector of the form +propertyInverseRelation where 'property' is replaced by the actual
+    property name. If such a method exists it is called, and must return a string.
+ 
+    In general you'll find it easier to implement the '+propertyInverseRelation' method(s) rather
+    than overriding this one. */
++ (nullable NSString*) inverseRelationForArrayProperty: (NSString*)property;
+
+/** The type of document. This is optional, but is commonly used in document databases 
+    to distinguish different types of documents. CBLModelFactory can use this property to 
+    determine what CBLModel subclass to instantiate for a document. */
+@property (copy, nonatomic, nullable) NSString* type;
 
 @end
 
@@ -201,3 +243,8 @@
 - (BOOL) autosaveAllModels: (NSError**)outError;
 
 @end
+
+
+#if __has_feature(nullability)
+#pragma clang assume_nonnull end
+#endif

@@ -18,6 +18,7 @@
 #import "CBLSocketChangeTracker.h"
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
+#import "CBLCookieStorage.h"
 #import "CBLStatus.h"
 #import "CBLBase64.h"
 #import "MYBlockUtils.h"
@@ -35,6 +36,7 @@
     NSInputStream* _trackingInput;
     CFAbsoluteTime _startTime;
     bool _gotResponseHeaders;
+    bool _readyToRead;
 }
 
 - (BOOL) start {
@@ -53,7 +55,20 @@
             urlRequest.HTTPBody = self.changesFeedPOSTBody;
             [urlRequest setValue: @"application/json" forHTTPHeaderField: @"Content-Type"];
         }
+
+        for (NSString* key in self.requestHeaders) {
+            if ([key caseInsensitiveCompare: @"Cookie"] == 0) {
+                urlRequest.HTTPShouldHandleCookies = NO;
+                break;
+            }
+        }
+
+        if (urlRequest.HTTPShouldHandleCookies) {
+            [self.cookieStorage addCookieHeaderToRequest: urlRequest];
+        }
+
         _http = [[WebSocketHTTPLogic alloc] initWithURLRequest: urlRequest];
+
         // Add headers from my .requestHeaders property:
         [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
             _http[key] = value;
@@ -81,33 +96,27 @@
     _http.handleRedirects = NO;  // CFStream will handle redirects instead
 
     // Configure HTTP proxy -- CFNetwork makes us do this manually, unlike NSURLConnection :-p
-    NSDictionary* proxy = url.my_proxySettings;
-    if (proxy) {
-        LogTo(ChangeTracker, @"Changes feed using proxy %@", proxy);
-        bool ok = CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPProxy,
-                                          (CFDictionaryRef)proxy);
+    CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
+    if (proxySettings) {
+        LogTo(ChangeTracker, @"Changes feed using proxy settings %@", proxySettings);
+        __unused Boolean ok = CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPProxy, proxySettings);
         Assert(ok);
+        CFRelease(proxySettings);
     }
 
-    if (_databaseURL.my_isHTTPS) {
-        // Enable SSL for this connection.
-        // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
-        // workaround taken from Apple technote TN2287:
-        // http://developer.apple.com/library/ios/#technotes/tn2287/
-        NSDictionary *settings = $dict({(id)kCFStreamSSLLevel,
-                                        @"kCFStreamSocketSecurityLevelTLSv1_0SSLv3"});
-        CFReadStreamSetProperty(cfInputStream,
-                                kCFStreamPropertySSLSettings, (CFTypeRef)settings);
-    }
-    
+    NSDictionary* tls = self.TLSSettings;
+    if (tls)
+        CFReadStreamSetProperty(cfInputStream, kCFStreamPropertySSLSettings, (CFTypeRef)tls);
+
     _gotResponseHeaders = false;
+    _readyToRead = NO;
 
     _trackingInput = (NSInputStream*)CFBridgingRelease(cfInputStream);
     [_trackingInput setDelegate: self];
     [_trackingInput scheduleInRunLoop: [NSRunLoop currentRunLoop] forMode: NSRunLoopCommonModes];
     [_trackingInput open];
     _startTime = CFAbsoluteTimeGetCurrent();
-    LogTo(ChangeTracker, @"%@: Started... <%@>", self, url);
+    LogTo(ChangeTracker, @"%@: Started... <%@>", self, url.my_sanitizedString);
     return YES;
 }
 
@@ -134,24 +143,17 @@
 
 
 - (BOOL) checkSSLCert {
+    BOOL trusted = YES;
     SecTrustRef sslTrust = (SecTrustRef) CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                                   kCFStreamPropertySSLPeerTrust);
     if (sslTrust) {
         NSURL* url = CFBridgingRelease(CFReadStreamCopyProperty((CFReadStreamRef)_trackingInput,
                                                                 kCFStreamPropertyHTTPFinalURL));
-        BOOL trusted = [_client changeTrackerApproveSSLTrust: sslTrust
-                                                     forHost: url.host
-                                                        port: (UInt16)url.port.intValue];
+
+        trusted = [self checkServerTrust: sslTrust forURL: url];
         CFRelease(sslTrust);
-        if (!trusted) {
-            //TODO: This error could be made more precise
-            self.error = [NSError errorWithDomain: NSURLErrorDomain
-                                             code: NSURLErrorServerCertificateUntrusted
-                                         userInfo: nil];
-            return NO;
-        }
     }
-    return YES;
+    return trusted;
 }
 
 
@@ -180,10 +182,21 @@
 }
 
 
+- (void) setPaused:(BOOL)paused {
+    if (paused != super.paused)
+        LogTo(ChangeTracker, @"%@: %@", self, (paused ? @"PAUSE" : @"RESUME"));
+    [super setPaused: paused];
+    if (!paused && _readyToRead)
+        [self readFromInput];
+}
+
+
 #pragma mark - STREAM HANDLING:
 
 
 - (void) readFromInput {
+    Assert(_readyToRead);
+    _readyToRead = false;
     uint8_t buffer[kReadLength];
     NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
     if (bytesRead > 0)
@@ -248,13 +261,6 @@
 
 
 - (void) failedWithError:(NSError*) error {
-    // Map lower-level errors from CFStream to higher-level NSURLError ones:
-    if ($equal(error.domain, NSPOSIXErrorDomain)) {
-        if (error.code == ECONNREFUSED)
-            error = [NSError errorWithDomain: NSURLErrorDomain
-                                        code: NSURLErrorCannotConnectToHost
-                                    userInfo: error.userInfo];
-    }
     [self clearConnection];
     [super failedWithError: error];
 }
@@ -269,7 +275,9 @@
                 if (![self checkSSLCert] || ![self readResponseHeader])
                     return;
             }
-            [self readFromInput];
+            _readyToRead = true;
+            if (!self.paused)
+                [self readFromInput];
             break;
         }
             

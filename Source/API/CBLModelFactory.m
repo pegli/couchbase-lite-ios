@@ -21,6 +21,7 @@
 @implementation CBLModelFactory
 {
     NSMutableDictionary* _typeDict;
+    NSMutableDictionary* _queryBuilders;
 }
 
 
@@ -62,6 +63,17 @@ static CBLModelFactory* sSharedInstance;
     return klass;
 }
 
+- (NSArray*) documentTypesForClass: (Class)modelClass {
+    NSArray *keys = [_typeDict allKeysForObject:modelClass];
+    if (keys.count == 0)
+        keys = [_typeDict allKeysForObject: NSStringFromClass(modelClass)];
+    return keys;
+}
+
+- (NSString*) documentTypeForClass: (Class)modelClass {
+    NSArray *keys = [self documentTypesForClass: modelClass];
+    return keys.count == 1 ? keys.firstObject : nil;
+}
 
 - (Class) classForDocument: (CBLDocument*)document {
     NSString* type = [document propertyForKey: @"type"];
@@ -75,6 +87,25 @@ static CBLModelFactory* sSharedInstance;
         return model;
     return [[self classForDocument: document] modelForDocument: document];
 }
+
+
+- (void) setQueryBuilder: (CBLQueryBuilder*)builder
+                forClass: (Class)klass
+                property: (NSString*)property
+{
+    id key = [[NSArray alloc] initWithObjects: property, klass, nil];  // klass might be nil
+    if (!_queryBuilders)
+        _queryBuilders = [[NSMutableDictionary alloc] init];
+    _queryBuilders[key] = builder;
+}
+
+- (CBLQueryBuilder*) queryBuilderForClass: (Class)klass
+                                 property: (NSString*)property
+{
+    id key = [[NSArray alloc] initWithObjects: property, klass, nil];  // klass might be nil
+    return _queryBuilders[key];
+}
+
 
 
 @end

@@ -16,15 +16,16 @@
 #import "CBLRemoteRequest.h"
 #import "CBLAuthorizer.h"
 #import "CBLMisc.h"
+#import "CBLStatus.h"
 #import "CBL_BlobStore.h"
 #import "CBLDatabase.h"
-#import "CBL_Router.h"
 #import "CBL_Replicator.h"
 #import "CollectionUtils.h"
 #import "Logging.h"
 #import "Test.h"
 #import "MYURLUtils.h"
 #import "GTMNSData+zlib.h"
+#import "CBLCookieStorage.h"
 
 
 // Max number of retry attempts for a transient failure, and the backoff time formula
@@ -35,11 +36,22 @@
 @implementation CBLRemoteRequest
 
 
-@synthesize delegate=_delegate, responseHeaders=_responseHeaders;
+@synthesize delegate=_delegate, responseHeaders=_responseHeaders, cookieStorage=_cookieStorage;
+@synthesize autoRetry = _autoRetry;
 
 
 + (NSString*) userAgentHeader {
-    return $sprintf(@"CouchbaseLite/%@", CBLVersion());
+    static NSString* sUserAgent;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+#if TARGET_OS_IPHONE
+        const char* platform = "iOS";
+#else
+        const char* platform = "Mac OS X";
+#endif
+        sUserAgent = $sprintf(@"CouchbaseLite/%s (%s)", CBL_VERSION_STRING, platform);
+    });
+    return sUserAgent;
 }
 
 
@@ -52,6 +64,7 @@
     self = [super init];
     if (self) {
         _onCompletion = [onCompletion copy];
+        _autoRetry = YES;
         _request = [[NSMutableURLRequest alloc] initWithURL: url];
         _request.HTTPMethod = method;
         _request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -60,8 +73,12 @@
         [_request setValue: [[self class] userAgentHeader] forHTTPHeaderField:@"User-Agent"];
         [requestHeaders enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
             [_request setValue:value forHTTPHeaderField:key];
+            // If app explicitly wants to set a cookie, we have to stop NSURLRequest from using its
+            // default cookie handling, else it overwrites "Cookie:" header with its own. (#532)
+            if ([key caseInsensitiveCompare: @"Cookie"] == 0)
+                _request.HTTPShouldHandleCookies = NO;
         }];
-        
+
         [self setupRequest: _request withBody: body];
 
     }
@@ -87,6 +104,15 @@
         _authorizer = authorizer;
         [_request setValue: [authorizer authorizeURLRequest: _request forRealm: nil]
         forHTTPHeaderField: @"Authorization"];
+    }
+}
+
+- (void) setCookieStorage:(CBLCookieStorage *)cookieStorage {
+    if (_cookieStorage != cookieStorage) {
+        _cookieStorage = cookieStorage;
+        if (_request.HTTPShouldHandleCookies) {
+            [_cookieStorage addCookieHeaderToRequest: _request];
+        }
     }
 }
 
@@ -189,8 +215,7 @@
     // Note: This assumes all requests are idempotent, since even though we got an error back, the
     // request might have succeeded on the remote server, and by retrying we'd be issuing it again.
     // PUT and POST requests aren't generally idempotent, but the ones sent by the replicator are.
-    
-    if (_retryCount >= kMaxRetries)
+    if (!_autoRetry || _retryCount >= kMaxRetries)
         return NO;
     NSTimeInterval delay = RetryDelay(_retryCount);
     ++_retryCount;
@@ -201,7 +226,7 @@
 
 
 - (bool) retryWithCredential {
-    if (_authorizer || _challenged)
+    if (!_autoRetry || _authorizer || _challenged)
         return false;
     _challenged = true;
     NSURLCredential* cred = [_request.URL my_credentialForRealm: nil
@@ -222,7 +247,7 @@
 #pragma mark - NSURLCONNECTION DELEGATE:
 
 
-static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
+void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     Warn(@"CouchbaseLite: SSL server <%@> not trusted; cert chain follows:", host);
 #if TARGET_OS_IPHONE
     for (CFIndex i = 0; i < SecTrustGetCertificateCount(trust); ++i) {
@@ -290,9 +315,9 @@ static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
             [sender useCredential: [NSURLCredential credentialForTrust: trust]
                     forAuthenticationChallenge: challenge];
         } else {
-            WarnUntrustedCert(space.host, trust);
-            LogTo(RemoteRequest, @"    challenge: cancel");
-            [sender cancelAuthenticationChallenge: challenge];
+            CBLWarnUntrustedCert(space.host, trust);
+            LogTo(RemoteRequest, @"    challenge: fail (untrusted cert)");
+            [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
         }
     } else {
         LogTo(RemoteRequest, @"    challenge: performDefaultHandling");
@@ -304,6 +329,10 @@ static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
     _status = (int) ((NSHTTPURLResponse*)response).statusCode;
     _responseHeaders = ((NSHTTPURLResponse*)response).allHeaderFields;
+
+    if (_cookieStorage)
+        [_cookieStorage setCookieFromResponse: (NSHTTPURLResponse*)response];
+
     LogTo(RemoteRequest, @"%@: Got response, status %d", self, _status);
     if (_status == 401) {
         // CouchDB says we're unauthorized but it didn't present a 'WWW-Authenticate' header
@@ -311,7 +340,7 @@ static void WarnUntrustedCert(NSString* host, SecTrustRef trust) {
         if ([self retryWithCredential])
             return;
     }
-    
+
 #if DEBUG
     if (!CBLStatusIsError(_status)) {
         // By setting the user default "CBLFakeFailureRate" to a number between 0.0 and 1.0,

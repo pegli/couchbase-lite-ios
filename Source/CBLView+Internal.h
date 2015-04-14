@@ -10,37 +10,11 @@
 #import "CBLDatabase+Internal.h"
 #import "CBLView.h"
 #import "CBLQuery.h"
+#import "CBL_ViewStorage.h"
+@class CBForestMapReduceIndex;
 
 
-/** Standard query options for views. */
-typedef struct CBLQueryOptions {
-    __unsafe_unretained id startKey;
-    __unsafe_unretained id endKey;
-    __unsafe_unretained NSString* startKeyDocID;
-    __unsafe_unretained NSString* endKeyDocID;
-    __unsafe_unretained NSArray* keys;
-    __unsafe_unretained NSString* fullTextQuery;
-    const struct CBLGeoRect* bbox;
-    unsigned skip;
-    unsigned limit;
-    unsigned groupLevel;
-    CBLContentOptions content;
-    BOOL descending;
-    BOOL includeDocs;
-    BOOL updateSeq;
-    BOOL localSeq;
-    BOOL inclusiveEnd;
-    BOOL reduceSpecified;
-    BOOL reduce;                   // Ignore if !reduceSpecified
-    BOOL group;
-    BOOL fullTextSnippets;
-    BOOL fullTextRanking;
-    CBLIndexUpdateMode indexUpdateMode;
-    CBLAllDocsMode allDocsMode;
-} CBLQueryOptions;
-
-extern const CBLQueryOptions kDefaultCBLQueryOptions;
-
+extern NSString* const kCBLViewChangeNotification;
 
 typedef enum {
     kCBLViewCollationUnicode,
@@ -49,39 +23,55 @@ typedef enum {
 } CBLViewCollation;
 
 
-@interface CBLView ()
+BOOL CBLRowPassesFilter(CBLDatabase* db, CBLQueryRow* row, const CBLQueryOptions* options);
+
+
+@interface CBLView () <CBL_ViewStorageDelegate>
 {
     @private
     CBLDatabase* __weak _weakDB;
+    id<CBL_ViewStorage> _storage;
     NSString* _name;
-    int _viewID;
     uint8_t _collation;
-    CBLContentOptions _mapContentOptions;
 }
 
-- (instancetype) initWithDatabase: (CBLDatabase*)db name: (NSString*)name;
+- (instancetype) initWithDatabase: (CBLDatabase*)db name: (NSString*)name create: (BOOL)create;
 
-- (void) databaseClosing;
+- (void) close;
 
-@property (readonly) int viewID;
-@end
+@property (readonly) NSUInteger totalRows;
 
+/** The map block alredy registered with the view. Unlike the public .mapBlock property, this
+    will not look for a design document or compile a function therein. */
+@property (readonly) CBLMapBlock registeredMapBlock;
 
-@interface CBLView (Internal)
+@property (readonly) SequenceNumber lastSequenceChangedAt;
 
-+ (void) registerFunctions: (CBLDatabase*)db;
+@property (readonly) id<CBL_ViewStorage> storage;
 
 #if DEBUG  // for unit tests only
 - (void) setCollation: (CBLViewCollation)collation;
+- (void) forgetMapBlock;
 #endif
 
+@property (readonly) NSArray* viewsInGroup;
+
+- (CBLStatus) compileFromDesignDoc;
+
 /** Compiles a view (using the registered CBLViewCompiler) from the properties found in a CouchDB-style design document. */
-- (BOOL) compileFromProperties: (NSDictionary*)viewProps
-                      language: (NSString*)language;
+- (CBLStatus) compileFromProperties: (NSDictionary*)viewProps
+                           language: (NSString*)language;
 
 /** Updates the view's index (incrementally) if necessary.
- @return  200 if updated, 304 if already up-to-date, else an error code */
+    If the index is updated, the other views in the viewGroup will be updated as a bonus.
+    @return  200 if updated, 304 if already up-to-date, else an error code */
 - (CBLStatus) updateIndex;
+
+/** Updates the view's index (incrementally) if necessary. No other groups will be updated.
+    @return  200 if updated, 304 if already up-to-date, else an error code */
+- (CBLStatus) updateIndexAlone;
+
+- (CBLStatus) updateIndexes: (NSArray*)views;
 
 @end
 
@@ -91,10 +81,25 @@ typedef enum {
 /** Queries the view. Does NOT first update the index.
     @param options  The options to use.
     @return  An array of CBLQueryRow. */
-- (NSArray*) _queryWithOptions: (const CBLQueryOptions*)options
-                        status: (CBLStatus*)outStatus;
-#if DEBUG
-- (NSArray*) dump;
-#endif
+- (CBLQueryIteratorBlock) _queryWithOptions: (CBLQueryOptions*)options
+                                     status: (CBLStatus*)outStatus;
 
+@end
+
+
+@interface CBLQueryEnumerator ()
+- (instancetype) initWithDatabase: (CBLDatabase*)database
+                             view: (CBLView*)view
+                   sequenceNumber: (SequenceNumber)sequenceNumber
+                         iterator: (CBLQueryIteratorBlock)iterator;
+- (instancetype) initWithDatabase: (CBLDatabase*)database
+                             view: (CBLView*)view
+                   sequenceNumber: (SequenceNumber)sequenceNumber
+                             rows: (NSArray*)rows;
+@end
+
+
+@interface CBLQueryRow ()
+- (void) moveToView: (CBLView*)view;
+- (void) _clearDatabase;
 @end

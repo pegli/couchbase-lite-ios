@@ -27,13 +27,13 @@
 
 @implementation CBLModel
 
+@dynamic type;
 
-- (instancetype) init {
-    return [self initWithDocument: nil];
-}
 
-- (instancetype) initWithDocument: (CBLDocument*)document
+- (instancetype) initWithDocument: (nullable CBLDocument*)document
+                       orDatabase: (nullable CBLDatabase*)database
 {
+    NSParameterAssert(document || database);
     self = [super init];
     if (self) {
         if (document) {
@@ -41,21 +41,29 @@
             self.document = document;
             [self didLoadFromDocument];
         } else {
+            LogTo(CBLModel, @"%@ initWithDatabase: %@", self.class, database);
             _isNew = true;
-            LogTo(CBLModel, @"%@ init", self);
+            self.database = database;
         }
+        [self awakeFromInitializer];
     }
     return self;
 }
 
 
-- (instancetype) initWithNewDocumentInDatabase: (CBLDatabase*)database {
++ (instancetype) modelForNewDocumentInDatabase: (CBLDatabase*)database {
     NSParameterAssert(database);
-    self = [self initWithDocument: nil];
-    if (self) {
-        self.database = database;
+    if (self == [CBLModel class]) {
+        Warn(@"Couldn't create a model object for a new document from the base CBLModel class.");
+        return nil;
     }
-    return self;
+
+    CBLModel *model = [[self alloc] initWithDocument:nil orDatabase:database];
+    NSString *documentType = [database.modelFactory documentTypeForClass:[self class]];
+    if(documentType != nil){
+        model.type = documentType;
+    }
+    return model;
 }
 
 
@@ -68,7 +76,7 @@
                  self, document, model);
     } else if (self != [CBLModel class]) {
         // If invoked on a subclass of CBLModel, create an instance of that subclass:
-        model = [[self alloc] initWithDocument: document];
+        model = [[self alloc] initWithDocument: document orDatabase:nil];
     } else {
         // If invoked on CBLModel itself, ask the factory to instantiate the appropriate class:
         model = [document.database.modelFactory modelForDocument: document];
@@ -110,12 +118,6 @@
 }
 
 
-- (void) detachFromDocument {
-    _document.modelObject = nil;
-    _document = nil;
-}
-
-
 - (NSString*) idForNewDocumentInDatabase: (CBLDatabase*)db {
     return nil;  // subclasses can override this to customize the doc ID
 }
@@ -134,7 +136,6 @@
         LogTo(CBLModel, @"%@ made new document", self);
     } else {
         [self deleteDocument: nil];
-        [self detachFromDocument];  // detach immediately w/o waiting for success
     }
 }
 
@@ -157,7 +158,6 @@
 
     if (![rev createRevisionWithProperties: properties error: outError])
         return NO;
-    [self detachFromDocument];
     return YES;
 }
 
@@ -167,13 +167,17 @@
 }
 
 
+- (void) awakeFromInitializer {
+    // subclasses can override this
+}
+
 - (void) didLoadFromDocument {
     // subclasses can override this
 }
 
 
 // Respond to an external change (likely from sync). This is called by my CBLDocument.
-- (void) CBLDocument: (CBLDocument*)doc didChange:(CBLDatabaseChange*)change {
+- (void) document: (CBLDocument*)doc didChange:(CBLDatabaseChange*)change {
     NSAssert(doc == _document, @"Notified for wrong document");
     if (_saving)
         return;  // this is just an echo from my -justSave: method, below, so ignore it
@@ -182,21 +186,34 @@
     _isNew = false;
     [self markExternallyChanged];
     
-    // Send KVO notifications about all my properties in case they changed:
+    // Prepare to send KVO notifications about all my properties in case they changed:
     NSSet* keys = [[self class] propertyNames];
     for (NSString* key in keys)
         [self willChangeValueForKey: key];
-    
-    // Remove unchanged cached values in _properties:
-    if (_changedNames && _properties) {
-        NSMutableSet* removeKeys = [NSMutableSet setWithArray: [_properties allKeys]];
-        [removeKeys minusSet: _changedNames];
-        [_properties removeObjectsForKeys: removeKeys.allObjects];
-    } else {
+
+    if (doc.isDeleted) {
+        // If doc was deleted, revert any unsaved changes and mark doc as unchanged:
         _properties = nil;
+        _changedNames = nil;
+        _changedAttachments = nil;
+        self.needsSave = NO;
+        // Detach from document:
+        _document.modelObject = nil;
+        _document = nil;
+
+    } else {
+        // Otherwise, remove unchanged cached values in _properties:
+        if (_changedNames && _properties) {
+            NSMutableSet* removeKeys = [NSMutableSet setWithArray: [_properties allKeys]];
+            [removeKeys minusSet: _changedNames];
+            [_properties removeObjectsForKeys: removeKeys.allObjects];
+        } else {
+            _properties = nil;
+        }
+        [self didLoadFromDocument];
     }
-    
-    [self didLoadFromDocument];
+
+    // Send KVO notifications about all my properties:
     for (NSString* key in keys)
         [self didChangeValueForKey: key];
 }
@@ -291,7 +308,6 @@
     if (!_needsSave || (!_changedNames && !_changedAttachments))
         return;
     _isNew = NO;
-    _properties = nil;
     _changedNames = nil;
     _changedAttachments = nil;
     self.needsSave = NO;
@@ -384,6 +400,8 @@
         value = [CBLJSON JSONObjectWithDate: value];
     else if ([value isKindOfClass: [NSDecimalNumber class]])
         value = [value stringValue];
+    else if ([value isKindOfClass: [NSURL class]])
+        value = [value absoluteString];
     else if ([value isKindOfClass: [CBLModel class]])
         value = ((CBLModel*)value).document.documentID;
     else if ([value isKindOfClass: [NSArray class]]) {
@@ -442,6 +460,16 @@
     return value;
 }
 
+- (id) getValueOfProperty: (NSString*)property ofClass: (Class)klass {
+    id value = _properties[property];
+    if (!value && !_isNew && ![_changedNames containsObject: property]) {
+        value = [_document propertyForKey: property];
+        if (![value isKindOfClass: klass])
+            value = nil;
+    }
+    return value;
+}
+
 
 - (BOOL) setValue: (id)value ofProperty: (NSString*)property {
     NSParameterAssert(_document);
@@ -462,6 +490,15 @@
     }
     return Nil;
 }
+
++ (NSString*) inverseRelationForArrayProperty: (NSString*)property {
+    SEL sel = NSSelectorFromString([property stringByAppendingString: @"InverseRelation"]);
+    if ([self respondsToSelector: sel]) {
+        return (NSString*)objc_msgSend(self, sel);
+    }
+    return nil;
+}
+
 
 
 - (CBLDatabase*) databaseForModelProperty: (NSString*)property {
@@ -492,6 +529,50 @@
                  declaredClass, doc, property, self, _document);
     }
     return value;
+}
+
+
+// Queries to find the value of a model-valued array property that's an inverse relation.
+- (NSArray*) findInverseOfRelation: (NSString*)relation
+                         fromClass: (Class)fromClass
+{
+    CBLModelFactory* factory = self.database.modelFactory;
+    CBLQueryBuilder* builder = [factory queryBuilderForClass: fromClass property: relation];
+    if (!builder) {
+        NSPredicate* pred;
+        if (fromClass) {
+            NSArray* types = [self.database.modelFactory documentTypesForClass: fromClass];
+            Assert(types.count > 0, @"Class %@ is not registered for any document types",
+                   fromClass);
+            pred = [NSPredicate predicateWithFormat: @"type in %@ and %K = $DOCID",
+                                 types, relation];
+        } else {
+            pred = [NSPredicate predicateWithFormat: @"%K = $DOCID", relation];
+        }
+        NSError* error;
+        builder = [[CBLQueryBuilder alloc] initWithDatabase: self.database
+                                                     select: nil
+                                             wherePredicate: pred
+                                                    orderBy: nil
+                                                      error: &error];
+        Assert(builder, @"Couldn't create query builder: %@", error);
+        [factory setQueryBuilder: builder forClass: fromClass property:relation];
+    }
+
+    CBLQuery* q = [builder createQueryWithContext: @{@"DOCID": self.document.documentID}];
+    NSError* error;
+    CBLQueryEnumerator* e = [q run: &error];
+    if (!e) {
+        Warn(@"Querying for inverse of %@.%@ failed: %@", fromClass, relation, error);
+        return nil;
+    }
+    NSMutableArray* docIDs = $marray();
+    for (CBLQueryRow* row in e)
+        [docIDs addObject: row.documentID];
+    return [[CBLModelArray alloc] initWithOwner: self
+                                       property: nil
+                                      itemClass: fromClass
+                                         docIDs: docIDs];
 }
 
 

@@ -18,11 +18,10 @@
 #import "CBL_Puller.h"
 #import "MYBlockUtils.h"
 
-#import "FMDatabase.h"
-#import "FMDatabaseAdditions.h"
-
 
 #define kActiveReplicatorCleanupDelay 10.0
+
+#define kLocalCheckpointDocId @"CBL_LocalCheckpoint"
 
 
 @implementation CBLDatabase (Replication)
@@ -70,63 +69,49 @@
 }
 
 
+static NSString* checkpointInfoKey(NSString* checkpointID) {
+    return [@"checkpoint/" stringByAppendingString: checkpointID];
+}
+
+
 - (NSString*) lastSequenceWithCheckpointID: (NSString*)checkpointID {
-    // This table schema is out of date but I'm keeping it the way it is for compatibility.
-    // The 'remote' column now stores the opaque checkpoint IDs, and 'push' is ignored.
-    return [_fmdb stringForQuery:@"SELECT last_sequence FROM replicators WHERE remote=?",
-                                 checkpointID];
+    return [_storage infoForKey: checkpointInfoKey(checkpointID)];
 }
 
 - (BOOL) setLastSequence: (NSString*)lastSequence withCheckpointID: (NSString*)checkpointID {
-    return [_fmdb executeUpdate: 
-            @"INSERT OR REPLACE INTO replicators (remote, push, last_sequence) VALUES (?, -1, ?)",
-            checkpointID, lastSequence];
+    return [_storage setInfo: lastSequence forKey: checkpointInfoKey(checkpointID)] == kCBLStatusOK;
 }
 
 
-+ (NSString*) joinQuotedStrings: (NSArray*)strings {
-    if (strings.count == 0)
-        return @"";
-    NSMutableString* result = [NSMutableString stringWithString: @"'"];
-    BOOL first = YES;
-    for (NSString* str in strings) {
-        if (first)
-            first = NO;
-        else
-            [result appendString: @"','"];
-        NSRange range = NSMakeRange(result.length, str.length);
-        [result appendString: str];
-        [result replaceOccurrencesOfString: @"'" withString: @"''"
-                                   options: NSLiteralSearch range: range];
-    }
-    [result appendString: @"'"];
+- (BOOL) saveLocalUUIDInLocalCheckpointDocument: (NSError**)outError {
+    return [self putLocalCheckpointDocumentWithKey: kCBLDatabaseLocalCheckpoint_LocalUUID
+                                             value: self.privateUUID
+                                          outError: outError];
+}
+
+- (BOOL) putLocalCheckpointDocumentWithKey: (NSString*)key
+                                     value:(id)value
+                                  outError: (NSError**)outError {
+    if (key == nil || value == nil)
+        return NO;
+
+    NSMutableDictionary* document = [NSMutableDictionary dictionaryWithDictionary:
+                                        [self getLocalCheckpointDocument]];
+    document[key] = value;
+    BOOL result = [self putLocalDocument: document withID: kLocalCheckpointDocId error: outError];
+    if (!result)
+        Warn(@"CBLDatabase: Could not create a local checkpoint document with an error: %@", *outError);
     return result;
 }
 
 
-- (BOOL) findMissingRevisions: (CBL_RevisionList*)revs {
-    if (revs.count == 0)
-        return YES;
-    NSString* sql = $sprintf(@"SELECT docid, revid FROM revs, docs "
-                              "WHERE revid in (%@) AND docid IN (%@) "
-                              "AND revs.doc_id == docs.doc_id",
-                             [CBLDatabase joinQuotedStrings: revs.allRevIDs],
-                             [CBLDatabase joinQuotedStrings: revs.allDocIDs]);
-    _fmdb.shouldCacheStatements = NO;
-    CBL_FMResultSet* r = [_fmdb executeQuery: sql];
-    _fmdb.shouldCacheStatements = YES;
-    if (!r)
-        return NO;
-    while ([r next]) {
-        @autoreleasepool {
-            CBL_Revision* rev = [revs revWithDocID: [r stringForColumnIndex: 0]
-                                           revID: [r stringForColumnIndex: 1]];
-            if (rev)
-                [revs removeRev: rev];
-        }
-    }
-    [r close];
-    return YES;
+- (NSDictionary*) getLocalCheckpointDocument {
+    return [self existingLocalDocumentWithID: kLocalCheckpointDocId];
+}
+
+
+- (id) getLocalCheckpointDocumentPropertyValueForKey: (NSString*)key {
+    return [[self getLocalCheckpointDocument] objectForKey: key];
 }
 
 

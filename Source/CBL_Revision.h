@@ -36,15 +36,32 @@ typedef SInt64 SequenceNumber;
 @property (readonly,copy) NSDictionary* properties;
 @property (readonly,copy) NSData* asJSON;
 
+/** Adds "_id", "_rev", "_deleted" properties */
+- (CBL_Revision*) revisionByAddingBasicMetadata;
+
+- (CBL_Revision*) copyWithoutBody;
+
+/** Returns the JSON to be stored into the database.
+    This has all the special keys like "_id" stripped out, and keys in canonical order. */
+@property (readonly) NSData* asCanonicalJSON;
+
++ (NSData*) asCanonicalJSON: (NSDictionary*)properties
+                      error: (NSError**)error;
+
 - (id) objectForKeyedSubscript: (NSString*)key;  // enables subscript access in Xcode 4.4+
 
 /** Returns the "_attachments" property, validating that it's a dictionary. */
 @property (readonly) NSDictionary* attachments;
 
-/** Revision's sequence number, or 0 if unknown.
+/** Revision's sequence number. If sequence is unknown/unset, throws an exception.
     This property is settable, but only once. That is, it starts out zero and can be
     set to the correct value, but after that it becomes immutable. */
 @property SequenceNumber sequence;
+
+/** Revision's sequence number, or 0 if unknown/unset. */
+@property (readonly) SequenceNumber sequenceIfKnown;
+
+- (void) forgetSequence;
 
 - (NSComparisonResult) compareSequences: (CBL_Revision*)rev;
 
@@ -68,8 +85,14 @@ typedef SInt64 SequenceNumber;
 
 @property (readwrite, strong) CBL_Body* body;
 @property (readwrite, copy) NSDictionary* properties;
-@property (readwrite, copy) NSData* asJSON;
 @property (readwrite) bool missing;
+
+/** Overridden to make this settable. When set, the "_id", "_rev" and "_deleted" properties will be
+    added to the JSON data; it MUST NOT already include them! */
+@property (readwrite, copy) NSData* asJSON;
+
+- (void) setDocID:(NSString *)docID
+            revID: (NSString*)revID;
 
 - (void) setObject: (id)object forKeyedSubscript: (NSString*)key;  // subscript access in Xcode 4.4+
 
@@ -90,6 +113,7 @@ typedef SInt64 SequenceNumber;
 
 @property (readonly) NSUInteger count;
 
+- (CBL_Revision*) revWithDocID: (NSString*)docID;
 - (CBL_Revision*) revWithDocID: (NSString*)docID revID: (NSString*)revID;
 
 - (NSEnumerator*) objectEnumerator;
@@ -102,11 +126,18 @@ typedef SInt64 SequenceNumber;
 
 - (void) addRev: (CBL_Revision*)rev;
 - (void) removeRev: (CBL_Revision*)rev;
+- (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev;  // returns the object removed, or nil
+- (void) removeObjectAtIndex: (NSUInteger)index;
 
 - (void) limit: (NSUInteger)limit;
 - (void) sortBySequence;
+- (void) sortByDocID;
 
 @end
+
+
+/** A block that can filter revisions by passing or rejecting them. */
+typedef BOOL (^CBL_RevisionFilter)(CBL_Revision*);
 
 
 /** Compares revision IDs by CouchDB rules: generation number first, then the suffix. */

@@ -8,13 +8,37 @@
 
 #import "CBLDatabase+Internal.h"
 #import "CBLManager+Internal.h"
-@class CBL_Server, CBLResponse, CBL_Body, CBLMultipartWriter;
+@class CBL_Server, CBLResponse, CBL_Body, CBLMultipartWriter, CBLQueryOptions;
+
+
+#if DEBUG
+extern NSTimeInterval kMinHeartbeat;    // Configurable for testing purposes only
+#endif
 
 
 typedef CBLStatus (^OnAccessCheckBlock)(CBLDatabase*, NSString *docID, SEL action);
 typedef void (^OnResponseReadyBlock)(CBLResponse*);
 typedef void (^OnDataAvailableBlock)(NSData* data, BOOL finished);
 typedef void (^OnFinishedBlock)();
+
+
+typedef enum : NSUInteger {
+    kNormalFeed,
+    kLongPollFeed,
+    kContinuousFeed,
+    kEventSourceFeed,
+} CBLChangesFeedMode;
+
+
+/** Options for what metadata to include in document bodies */
+typedef unsigned CBLContentOptions;
+enum {
+    kCBLIncludeAttachments = 1,              // adds inline bodies of attachments
+    kCBLIncludeConflicts = 2,                // adds '_conflicts' property (if relevant)
+    kCBLIncludeRevs = 4,                     // adds '_revisions' property
+    kCBLIncludeRevsInfo = 8,                 // adds '_revs_info' property
+    kCBLIncludeLocalSeq = 16,                // adds '_local_seq' property
+};
 
 
 @interface CBL_Router : NSObject
@@ -37,11 +61,13 @@ typedef void (^OnFinishedBlock)();
     OnDataAvailableBlock _onDataAvailable;
     OnFinishedBlock _onFinished;
     BOOL _running;
-    BOOL _longpoll;
+    CBLChangesFeedMode _changesMode;
+    CBLContentOptions _changesContentOptions;
     CBLFilterBlock _changesFilter;
     NSDictionary* _changesFilterParams;
     BOOL _changesIncludeDocs;
     BOOL _changesIncludeConflicts;
+    NSTimer *_heartbeatTimer;
 }
 
 - (instancetype) initWithServer: (CBL_Server*)server
@@ -69,17 +95,30 @@ typedef void (^OnFinishedBlock)();
 - (BOOL) boolQuery: (NSString*)param;
 - (int) intQuery: (NSString*)param defaultValue: (int)defaultValue;
 - (id) jsonQuery: (NSString*)param error: (NSError**)outError;
-- (NSMutableDictionary*) jsonQueries;
+@property NSDictionary* queries;
+- (void) parseChangesMode;
 - (BOOL) cacheWithEtag: (NSString*)etag;
 - (CBLContentOptions) contentOptions;
-- (BOOL) getQueryOptions: (struct CBLQueryOptions*)options;
+- (CBLQueryOptions*) getQueryOptions;
 - (BOOL) explicitlyAcceptsType: (NSString*)mimeType;
 @property (readonly) NSDictionary* bodyAsDictionary;
 @property (readonly) NSString* ifMatch;
 - (CBLStatus) openDB;
 - (void) sendResponseHeaders;
+- (void) sendData: (NSData*)data;
+- (void) sendContinuousLine: (NSDictionary*)changeDict;
 - (void) sendResponseBodyAndFinish: (BOOL)finished;
 - (void) finished;
+- (void) startHeartbeat: (NSString*)response interval: (NSTimeInterval)interval;
+- (void) stopHeartbeat;
+@end
+
+
+@interface CBL_Router (Handlers)
+- (CBLStatus) do_GETRoot;
+- (CBL_Revision*) applyOptions: (CBLContentOptions)options
+                    toRevision: (CBL_Revision*)rev
+                        status: (CBLStatus*)outStatus;
 @end
 
 

@@ -3,7 +3,7 @@
 //  CouchbaseLite
 //
 //  Created by Jens Alfke on 6/17/11.
-//  Copyright 2011-2013 Couchbase, Inc.
+//  Copyright (c) 2011-2015 Couchbase, Inc.
 //
 //  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
 //  except in compliance with the License. You may obtain a copy of the License at
@@ -80,6 +80,10 @@ static const NSUInteger kDefaultRetainLimit = 50;
     if (doc && _cache && ![_cache objectForKey:docID])
         [_cache setObject: doc forKey: docID];  // re-add doc to NSCache since it's recently used
     return doc;
+}
+
+- (id<CBLCacheable>) resourceWithCacheKeyDontRecache: (NSString*)docID {
+    return [_map objectForKey: docID];
 }
 
 

@@ -16,6 +16,7 @@
 #import "CBLJSON.h"
 #import "CBLParseDate.h"
 #import "CBLBase64.h"
+#import "CBLMisc.h"
 
 
 @implementation CBLJSON
@@ -67,6 +68,12 @@ static NSTimeInterval k1970ToReferenceDate;
     NSData* extraJson = [self dataWithJSONObject: dict options: 0 error: NULL];
     if (!extraJson)
         return nil;
+    return [self appendJSONDictionaryData: (NSData*)extraJson toJSONDictionaryData: json];
+}
+
++ (NSData*) appendJSONDictionaryData: (UU NSData*)extraJson
+                toJSONDictionaryData: (UU NSData*)json
+{
     size_t jsonLength = json.length;
     size_t extraLength = extraJson.length;
     CAssert(jsonLength >= 2);
@@ -95,7 +102,7 @@ static size_t estimate(id object) {
     } else if ([object isKindOfClass: [NSDictionary class]]) {
         size_t size = kObjectOverhead + sizeof(NSUInteger);
         for (NSString* key in object)
-            size += (kObjectOverhead + 2*[key length]) + estimate([object objectForKey: key]);
+            size += (kObjectOverhead + 2*[key length]) + estimate(object[key]);
         return size;
     } else if ([object isKindOfClass: [NSArray class]]) {
         size_t size = kObjectOverhead + sizeof(NSUInteger);
@@ -106,6 +113,7 @@ static size_t estimate(id object) {
         return kObjectOverhead;
     } else {
         Assert(NO, @"Illegal object type %@ in JSON", [object class]);
+        return 0;
     }
 }
 
@@ -124,19 +132,25 @@ static NSDateFormatter* getISO8601Formatter() {
     if (!sFormatter) {
         // Thanks to DenNukem's answer in http://stackoverflow.com/questions/399527/
         sFormatter = [[NSDateFormatter alloc] init];
-        sFormatter.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'";
-        sFormatter.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+        sFormatter.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSSXXX";
         sFormatter.calendar = [[NSCalendar alloc] initWithCalendarIdentifier:NSGregorianCalendar];
         sFormatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US"];
     }
+
     return sFormatter;
 }
 
 + (NSString*) JSONObjectWithDate: (NSDate*)date {
+    return [self JSONObjectWithDate:date timeZone:[NSTimeZone timeZoneForSecondsFromGMT:0]];
+}
+
++ (NSString*) JSONObjectWithDate: (NSDate*)date timeZone:(NSTimeZone *)tz {
     if (!date)
         return nil;
     @synchronized(self) {
-        return [getISO8601Formatter() stringFromDate: date];
+        NSDateFormatter *formatter = getISO8601Formatter();
+        formatter.timeZone = tz;
+        return [formatter stringFromDate: date];
     }
 }
 
@@ -183,14 +197,14 @@ static NSDateFormatter* getISO8601Formatter() {
                 return nil;
             key = [key stringByReplacingOccurrencesOfString: @"~1" withString: @"/"];
             key = [key stringByReplacingOccurrencesOfString: @"~0" withString: @"~"];
-            object = [object objectForKey: key];
+            object = object[key];
             if (!object)
                 return nil;
         } else if ([object isKindOfClass: [NSArray class]]) {
             int index;
             if (![scanner scanInt: &index] || index < 0 || index >= (int)[object count])
                 return nil;
-            object = [object objectAtIndex: index];
+            object = object[index];
         } else {
             return nil;
         }
@@ -224,11 +238,11 @@ static NSDateFormatter* getISO8601Formatter() {
 }
 
 - (id)objectAtIndex:(NSUInteger)index {
-    id obj = [_array objectAtIndex: index];
+    id obj = _array[index];
     if ([obj isKindOfClass: [NSData class]]) {
         obj = [CBLJSON JSONObjectWithData: obj options: CBLJSONReadingAllowFragments
                                    error: nil];
-        [_array replaceObjectAtIndex: index withObject: obj];
+        _array[index] = obj;
     }
     return obj;
 }
@@ -238,21 +252,6 @@ static NSDateFormatter* getISO8601Formatter() {
 
 
 #if DEBUG
-
-TestCase(CBLJSON_Date) {
-    AssertAlmostEq([CBLJSON absoluteTimeWithJSONObject: @"2013-04-01T20:42:33Z"], 386541753.000, 1e-6);
-    NSDate* date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33Z"];
-    CAssertEq(date.timeIntervalSinceReferenceDate, 386541753.000);
-    date = [CBLJSON dateWithJSONObject: @"2013-04-01T20:42:33.388Z"];
-    AssertAlmostEq(date.timeIntervalSinceReferenceDate, 386541753.388, 1e-6);
-    CAssertNil([CBLJSON dateWithJSONObject: @""]);
-    CAssertNil([CBLJSON dateWithJSONObject: @"1347554643"]);
-    CAssertNil([CBLJSON dateWithJSONObject: @"20:42:33Z"]);
-
-    CAssert(isnan([CBLJSON absoluteTimeWithJSONObject: @""]));
-
-    CAssertEqual([CBLJSON JSONObjectWithDate: date], @"2013-04-01T20:42:33.388Z");
-}
 
 
 #if 0 // this is a performance not a correctness test; and it's slow

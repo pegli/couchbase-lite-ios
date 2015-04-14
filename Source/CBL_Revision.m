@@ -14,7 +14,9 @@
 //  and limitations under the License.
 
 #import "CBL_Revision.h"
+#import "CBLInternal.h"
 #import "CBL_Body.h"
+#import "CBJSONEncoder.h"
 #import "CBLMisc.h"
 
 
@@ -28,8 +30,8 @@
     bool _missing;
 }
 
-- (instancetype) initWithDocID: (NSString*)docID
-                         revID: (NSString*)revID
+- (instancetype) initWithDocID: (UU NSString*)docID
+                         revID: (UU NSString*)revID
                        deleted: (BOOL)deleted
 {
     self = [super init];
@@ -45,7 +47,7 @@
     return self;
 }
 
-- (instancetype) initWithBody: (CBL_Body*)body {
+- (instancetype) initWithBody: (UU CBL_Body*)body {
     Assert(body);
     NSDictionary* props = body.properties;
     self = [self initWithDocID: props.cbl_id
@@ -57,7 +59,7 @@
     return self;
 }
 
-- (instancetype) initWithProperties: (NSDictionary*)properties {
+- (instancetype) initWithProperties: (UU NSDictionary*)properties {
     CBL_Body* body = [[CBL_Body alloc] initWithProperties: properties];
     if (!body) {
         return nil;
@@ -65,7 +67,7 @@
     return [self initWithBody: body];
 }
 
-+ (instancetype) revisionWithProperties: (NSDictionary*)properties {
++ (instancetype) revisionWithProperties: (UU NSDictionary*)properties {
     return [[self alloc] initWithProperties: properties];
 }
 
@@ -75,7 +77,8 @@
 }
 
 - (id) mutableCopyWithZone: (NSZone*)zone {
-    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: _docID revID: _revID
+    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: _docID
+                                                                    revID: _revID
                                                                   deleted: _deleted];
     rev.body = _body;
     rev.sequence = _sequence;
@@ -83,9 +86,24 @@
     return rev;
 }
 
+- (CBL_Revision*) copyWithoutBody {
+    if (!_body && self.class == [CBL_Revision class])
+        return self;
+    CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: _docID revID: _revID
+                                                    deleted: _deleted];
+    rev->_sequence = _sequence;
+    rev->_missing = _missing;
+    return rev;
+}
+
 @synthesize docID=_docID, revID=_revID, deleted=_deleted, missing=_missing, body=_body;
 
+- (SequenceNumber) sequenceIfKnown {
+    return _sequence;
+}
+
 - (SequenceNumber) sequence {
+    Assert(_sequence, @"Sequence of %@ unknown", self);
     return _sequence;
 }
 
@@ -96,11 +114,15 @@
     }
 }
 
+- (void) forgetSequence {
+    _sequence = 0;
+}
+
 - (unsigned) generation {
     return [[self class] generationFromRevID: _revID];
 }
 
-+ (unsigned) generationFromRevID: (NSString*)revID {
++ (unsigned) generationFromRevID: (UU NSString*)revID {
     unsigned generation = 0;
     NSUInteger length = MIN(revID.length, 9u);
     for (NSUInteger i=0; i<length; ++i) {
@@ -116,7 +138,7 @@
 }
 
 // Splits a revision ID into its generation number and opaque suffix string
-+ (BOOL) parseRevID: (NSString*)revID intoGeneration: (int*)outNum andSuffix:(NSString**)outSuffix
++ (BOOL) parseRevID: (UU NSString*)revID intoGeneration: (int*)outNum andSuffix:(NSString**)outSuffix
 {
     NSScanner* scanner = [[NSScanner alloc] initWithString: revID];
     scanner.charactersToBeSkipped = nil;
@@ -147,7 +169,7 @@
     return $sprintf(@"{%@ #%@%@}", _docID, _revID, (_deleted ?@" DEL" :@""));
 }
 
-- (BOOL) isEqual:(id)object {
+- (BOOL) isEqual:(UU id)object {
     return [_docID isEqual: [object docID]] && [_revID isEqual: [object revID]];
 }
 
@@ -155,25 +177,77 @@
     return _docID.hash ^ _revID.hash;
 }
 
-- (NSComparisonResult) compareSequences: (CBL_Revision*)rev {
+- (NSComparisonResult) compareSequences: (UU CBL_Revision*)rev {
     NSParameterAssert(rev != nil);
     return CBLSequenceCompare(_sequence, rev->_sequence);
 }
 
-- (CBL_MutableRevision*) mutableCopyWithDocID: (NSString*)docID revID: (NSString*)revID {
-    Assert(docID);
-    Assert(!_docID || $equal(_docID, docID));
-    CBL_MutableRevision* rev = [[CBL_MutableRevision alloc] initWithDocID: docID revID: revID
-                                                                  deleted: _deleted];
-
-    // Update the _id and _rev in the new object's JSON:
-    NSDictionary* properties = self.properties;
-    NSMutableDictionary* nuProperties = properties ? [properties mutableCopy]
-                                                   : [[NSMutableDictionary alloc] init];
-    [nuProperties setValue: docID forKey: @"_id"];
-    [nuProperties setValue: revID forKey: @"_rev"];
-    rev.properties = nuProperties;
+- (CBL_MutableRevision*) mutableCopyWithDocID: (UU NSString*)docID revID: (UU NSString*)revID {
+    CBL_MutableRevision* rev = [self mutableCopy];
+    [rev setDocID: docID revID: revID];
     return rev;
+}
+
+- (CBL_Revision*) revisionByAddingBasicMetadata {
+    NSMutableDictionary* props = [self.properties mutableCopy];
+    props[@"_id"] = self.docID;
+    props[@"_rev"] = self.revID;
+    if (_deleted)
+        props[@"_deleted"] = @YES;
+    CBL_Revision* result = [[CBL_Revision alloc] initWithProperties: props];
+    result->_sequence = _sequence;
+    return result;
+}
+
+
+- (NSData*) asCanonicalJSON {
+    return [[self class] asCanonicalJSON: self.properties error: NULL];
+}
+
+/** Returns the JSON to be stored into the database.
+    This has all the special keys like "_id" stripped out, and keys in canonical order. */
++ (NSData*) asCanonicalJSON: (UU NSDictionary*)properties error: (NSError**)outError {
+    // Initialize the key filter that will strip out top level "_"-prefixed keys:
+    static CBJSONEncoderKeyFilter sKeyFilter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSSet* specialKeysToRemove, *specialKeysToLeave;
+        specialKeysToRemove = [[NSSet alloc] initWithObjects: @"_id", @"_rev",
+                                       @"_deleted", @"_revisions", @"_revs_info", @"_conflicts",
+                                       @"_deleted_conflicts", @"_local_seq", nil];
+        specialKeysToLeave = [[NSSet alloc] initWithObjects:
+                               @"_attachments", @"_removed", nil];
+        sKeyFilter = ^BOOL(NSString* key, NSError** outError) {
+            if (![key hasPrefix: @"_"]) {
+                return YES;
+            } else if ([specialKeysToRemove member: key]) {
+                return NO;
+            } else if ([specialKeysToLeave member: key]) {
+                return YES;
+            } else {
+                Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
+                return ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
+            }
+        };
+    });
+
+    if (!properties) {
+        ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
+        return nil;
+    }
+
+    // Create canonical JSON -- this is important, because the JSON data returned here will be used
+    // to create the new revision ID, and we need to guarantee that equivalent revision bodies
+    // result in equal revision IDs.
+    CBJSONEncoder* encoder = [[CBJSONEncoder alloc] init];
+    encoder.canonical = YES;
+    encoder.keyFilter = sKeyFilter;
+    if (![encoder encode: properties]) {
+        if (outError)
+            *outError = encoder.error;
+        return nil;
+    }
+    return encoder.encodedData;
 }
 
 
@@ -183,19 +257,44 @@
 
 @implementation CBL_MutableRevision
 
-- (void) setBody:(CBL_Body *)body {
+@dynamic body, properties, asJSON, missing;     // Necessary because this class redeclares them
+
+- (void) setBody:(UU CBL_Body *)body {
     _body = body;
 }
 
-- (void) setProperties:(NSDictionary *)properties {
-    self.body = [CBL_Body bodyWithProperties: properties];
+- (void) setDocID:(UU NSString *)docID revID: (UU NSString*)revID {
+    Assert(docID);
+
+    if (_docID)
+        Assert($equal(_docID, docID));
+    else
+        _docID = [docID copy];
+    _revID = [revID copy];
+
+    // Update the _id and _rev in the JSON, but only if those properties were already set:
+    NSDictionary* properties = self.properties;
+    if (properties) {
+        NSString* idProp = properties.cbl_id, *revProp = properties.cbl_rev;
+        if ((idProp && !$equal(idProp, _docID)) || (revProp && !$equal(revProp, revID))) {
+            NSMutableDictionary* nuProperties = [properties mutableCopy];
+            [nuProperties setValue: docID forKey: @"_id"];
+            [nuProperties setValue: revID forKey: @"_rev"];
+            self.properties = [nuProperties copy];
+        }
+    }
 }
 
-- (void) setAsJSON:(NSData *)asJSON {
-    self.body = [CBL_Body bodyWithJSON: asJSON];
+- (void) setProperties:(UU NSDictionary *)properties {
+    _body = [[CBL_Body alloc] initWithProperties: properties];
 }
 
-- (void) setObject: (id)object forKeyedSubscript: (NSString*)key {
+- (void) setAsJSON:(UU NSData *)asJSON {
+    _body = [[CBL_Body alloc] initWithJSON: asJSON
+                               addingDocID: _docID revID: _revID deleted: _deleted];
+}
+
+- (void) setObject: (UU id)object forKeyedSubscript: (UU NSString*)key {
     NSMutableDictionary* nuProps = self.properties.mutableCopy;
     [nuProps setValue: object forKey: key];
     self.properties = nuProps;
@@ -210,6 +309,7 @@
 }
 
 - (id) copyWithZone: (NSZone*)zone {
+    // Overridden because CBL_Revision just returns `self` instead of making a copy
     CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: _docID revID: _revID deleted: _deleted];
     rev->_body = _body;
     rev->_sequence = _sequence;
@@ -301,6 +401,27 @@
     [_revs removeObject: rev];
 }
 
+- (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev {
+    NSUInteger index = [_revs indexOfObject: rev];
+    if (index == NSNotFound)
+        return nil;
+    rev = _revs[index];
+    [_revs removeObjectAtIndex: index];
+    return rev;
+}
+
+- (CBL_Revision*) revWithDocID: (NSString*)docID {
+    for (CBL_Revision* rev in _revs) {
+        if ($equal(rev.docID, docID))
+            return rev;
+    }
+    return nil;
+}
+
+- (void) removeObjectAtIndex: (NSUInteger)index {
+    [_revs removeObjectAtIndex: index];
+}
+
 - (CBL_Revision*) revWithDocID: (NSString*)docID revID: (NSString*)revID {
     for (CBL_Revision* rev in _revs) {
         if ($equal(rev.docID, docID) && $equal(rev.revID, revID))
@@ -335,6 +456,12 @@
 
 - (void) sortBySequence {
     [_revs sortUsingSelector: @selector(compareSequences:)];
+}
+
+- (void) sortByDocID {
+    [_revs sortUsingComparator: ^NSComparisonResult(CBL_Revision* r1, CBL_Revision* r2) {
+        return [r1.docID compare: r2.docID];
+    }];
 }
 
 
@@ -399,66 +526,3 @@ NSComparisonResult CBLCompareRevIDs(NSString* revID1, NSString* revID2) {
     const char* rev2str = [revID2 UTF8String];
     return CBLCollateRevIDs(NULL, (int)strlen(rev1str), rev1str, (int)strlen(rev2str), rev2str);
 }
-
-
-
-#pragma mark - TESTS:
-#if DEBUG
-
-static BOOL parseRevID(NSString* revID, int *gen, NSString** suffix) {
-    return [CBL_Revision parseRevID: revID intoGeneration: gen andSuffix: suffix];
-}
-
-static int collateRevs(const char* rev1, const char* rev2) {
-    return CBLCollateRevIDs(NULL, (int)strlen(rev1), rev1, (int)strlen(rev2), rev2);
-}
-
-TestCase(CBL_Database_ParseRevID) {
-    RequireTestCase(CBLDatabase);
-    int num;
-    NSString* suffix;
-    CAssert(parseRevID(@"1-utiopturoewpt", &num, &suffix));
-    CAssertEq(num, 1);
-    CAssertEqual(suffix, @"utiopturoewpt");
-    
-    CAssert(parseRevID(@"321-fdjfdsj-e", &num, &suffix));
-    CAssertEq(num, 321);
-    CAssertEqual(suffix, @"fdjfdsj-e");
-    
-    CAssert(!parseRevID(@"0-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"-4-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"5_fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@" 5-fdjfdsj-e", &num, &suffix));
-    CAssert(!parseRevID(@"7 -foo", &num, &suffix));
-    CAssert(!parseRevID(@"7-", &num, &suffix));
-    CAssert(!parseRevID(@"7", &num, &suffix));
-    CAssert(!parseRevID(@"eiuwtiu", &num, &suffix));
-    CAssert(!parseRevID(@"", &num, &suffix));
-}
-
-TestCase(CBLCollateRevIDs) {
-    // Single-digit:
-    CAssertEq(collateRevs("1-foo", "1-foo"), 0);
-    CAssertEq(collateRevs("2-bar", "1-foo"), 1);
-    CAssertEq(collateRevs("1-foo", "2-bar"), -1);
-    // Multi-digit:
-    CAssertEq(collateRevs("123-bar", "456-foo"), -1);
-    CAssertEq(collateRevs("456-foo", "123-bar"), 1);
-    CAssertEq(collateRevs("456-foo", "456-foo"), 0);
-    CAssertEq(collateRevs("456-foo", "456-foofoo"), -1);
-    // Different numbers of digits:
-    CAssertEq(collateRevs("89-foo", "123-bar"), -1);
-    CAssertEq(collateRevs("123-bar", "89-foo"), 1);
-    // Edge cases:
-    CAssertEq(collateRevs("123-", "89-"), 1);
-    CAssertEq(collateRevs("123-a", "123-a"), 0);
-    // Invalid rev IDs:
-    CAssertEq(collateRevs("-a", "-b"), -1);
-    CAssertEq(collateRevs("-", "-"), 0);
-    CAssertEq(collateRevs("", ""), 0);
-    CAssertEq(collateRevs("", "-b"), -1);
-    CAssertEq(collateRevs("bogus", "yo"), -1);
-    CAssertEq(collateRevs("bogus-x", "yo-y"), -1);
-}
-
-#endif

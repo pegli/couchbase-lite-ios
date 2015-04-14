@@ -15,6 +15,7 @@
 
 #import <Foundation/Foundation.h>
 @class CBLChangeTracker;
+@class CBLCookieStorage;
 @protocol CBLAuthorizer;
 
 
@@ -59,6 +60,7 @@ typedef enum CBLChangeTrackerMode {
     NSTimeInterval _heartbeat;
     NSDictionary* _requestHeaders;
     id<CBLAuthorizer> _authorizer;
+    CBLCookieStorage* _cookieStorage;
     unsigned _retryCount;
     BOOL _caughtUp;
 }
@@ -79,6 +81,8 @@ typedef enum CBLChangeTrackerMode {
 @property (weak, nonatomic) id<CBLChangeTrackerClient> client;
 @property (strong, nonatomic) NSDictionary *requestHeaders;
 @property (strong, nonatomic) id<CBLAuthorizer> authorizer;
+@property (strong, nonatomic) CBLCookieStorage* cookieStorage;
+
 @property (nonatomic) BOOL usePOST;
 
 @property (nonatomic) CBLChangeTrackerMode mode;
@@ -91,6 +95,8 @@ typedef enum CBLChangeTrackerMode {
 - (BOOL) start;
 - (void) stop;
 
+@property (nonatomic) BOOL paused;
+
 /** Asks the tracker to retry connecting, _if_ it's currently disconnected but waiting to retry.
     This should be called when the reachability of the remote host changes, or when the
     app is reactivated. */
@@ -100,6 +106,8 @@ typedef enum CBLChangeTrackerMode {
 @property (readonly) NSString* feed;
 @property (readonly) NSString* changesFeedPath;
 @property (readonly) NSData* changesFeedPOSTBody;
+@property (readonly) NSDictionary* TLSSettings;
+- (BOOL) checkServerTrust: (SecTrustRef)sslTrust forURL: (NSURL*)url;
 - (void) retryAfterDelay: (NSTimeInterval)retryDelay;
 - (void) setUpstreamError: (NSString*)message;
 - (void) failedWithError: (NSError*)error;

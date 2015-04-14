@@ -8,7 +8,7 @@
 
 #import <Foundation/Foundation.h>
 
-@class CBLDatabase, CBL_Revision, CBL_RevisionList, CBLBatcher, CBLReachability;
+@class CBLDatabase, CBL_Revision, CBL_RevisionList, CBLBatcher, CBLReachability, CBLCookieStorage;
 @protocol CBLAuthorizer;
 
 typedef CBL_Revision* (^RevisionBodyTransformationBlock)(CBL_Revision*);
@@ -36,6 +36,7 @@ extern NSString* CBL_ReplicatorStoppedNotification;
     NSDictionary* _options;
     NSDictionary* _requestHeaders;
     NSString* _serverType;
+    CBLCookieStorage* _cookieStorage;
 #if TARGET_OS_IPHONE
     NSUInteger /*UIBackgroundTaskIdentifier*/ _bgTask;
 #endif
@@ -56,6 +57,7 @@ extern NSString* CBL_ReplicatorStoppedNotification;
 @property (readonly) NSURL* remote;
 @property (readonly) BOOL isPush;
 @property (readonly) BOOL continuous;
+@property (readonly) CBLCookieStorage* cookieStorage;
 @property (copy) NSString* filterName;
 @property (copy) NSDictionary* filterParameters;
 @property (copy) NSArray *docIDs;
@@ -78,6 +80,9 @@ extern NSString* CBL_ReplicatorStoppedNotification;
     Any pending asynchronous operations will be canceled.
     CBL_ReplicatorStoppedNotification will be posted when it finally stops. */
 - (void) stop;
+
+/** Setting suspended to YES pauses the replicator. */
+@property (nonatomic) BOOL suspended;
 
 /** Is the replicator running? (Observable) */
 @property (readonly, nonatomic) BOOL running;
@@ -115,6 +120,8 @@ extern NSString* CBL_ReplicatorStoppedNotification;
 
 - (CBL_Revision *) transformRevision:(CBL_Revision *)rev;
 
+@property (readonly) SecCertificateRef serverCert;
+
 @end
 
 
@@ -124,3 +131,9 @@ extern NSString* CBL_ReplicatorStoppedNotification;
 #define kCBLReplicatorOption_Heartbeat @"heartbeat"         // NSNumber, in ms
 #define kCBLReplicatorOption_PollInterval @"poll"           // NSNumber, in ms
 #define kCBLReplicatorOption_Network @"network"             // "WiFi" or "Cell"
+#define kCBLReplicatorOption_UseWebSocket @"websocket"      // Boolean; default is YES
+#define kCBLReplicatorOption_PinnedCert @"pinnedCert"       // NSData or (hex) NSString
+
+// Boolean; default is YES. Setting this option will have no effect and result to always 'trust' if
+// the kCBLReplicatorOption_Network option is also set.
+#define kCBLReplicatorOption_TrustReachability @"trust_reachability"

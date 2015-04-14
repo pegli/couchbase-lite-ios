@@ -9,10 +9,11 @@
 #import "CouchbaseLite.h"
 #import "CBLCache.h"
 #import "CBLDatabase.h"
+#import "CBLDatabaseChange.h"
 #import "CBLReplication+Transformation.h"
 #import "CBL_Revision.h"
 #import "CBLGeometry.h"
-@class CBLDatabaseChange, CBL_Revision, CBLManager, CBL_Server;
+@class CBL_Server;
 
 
 @interface CBLManager ()
@@ -25,27 +26,53 @@
 
 
 @interface CBLDatabase ()
-- (instancetype) initWithPath: (NSString*)path
-                         name: (NSString*)name
-                      manager: (CBLManager*)manager
-                     readOnly: (BOOL)readOnly;
+- (instancetype) initWithDir: (NSString*)dir
+                        name: (NSString*)name
+                     manager: (CBLManager*)manager
+                    readOnly: (BOOL)readOnly;
 @property (readonly, nonatomic) NSMutableSet* unsavedModelsMutable;
 - (void) removeDocumentFromCache: (CBLDocument*)document;
 - (void) doAsyncAfterDelay: (NSTimeInterval)delay block: (void (^)())block;
+- (BOOL) waitFor: (BOOL (^)())block;
 - (void) addReplication: (CBLReplication*)repl;
 - (void) forgetReplication: (CBLReplication*)repl;
-#if DEBUG // for testing
-- (CBLDocument*) _cachedDocumentWithID: (NSString*)docID;
 - (void) _clearDocumentCache;
-#endif
+- (CBLDocument*) _cachedDocumentWithID: (NSString*)docID;
+@end
+
+@interface CBLDatabase (Private)
+@property (nonatomic, readonly) NSString* privateUUID;
+@property (nonatomic, readonly) NSString* publicUUID;
+@end
+
+
+@interface CBLDatabaseChange ()
+- (instancetype) initWithAddedRevision: (CBL_Revision*)addedRevision
+                     winningRevisionID: (NSString*)winningRevisionID
+                            inConflict: (BOOL)maybeConflict
+                                source: (NSURL*)source;
+/** The revision just added. Guaranteed immutable. */
+@property (nonatomic, readonly) CBL_Revision* addedRevision;
+/** The revID of the default "winning" revision, or nil if it did not change. */
+@property (nonatomic, readonly) NSString* winningRevisionID;
+/** The revision that is now the default "winning" revision of the document, or nil if not known
+    Guaranteed immutable.*/
+@property (nonatomic, readonly) CBL_Revision* winningRevisionIfKnown;
+/** Is this a relayed notification of one from another thread, not the original? */
+@property (nonatomic, readonly) bool echoed;
+/** Discards the body of the revision to save memory. */
+- (void) reduceMemoryUsage;
 @end
 
 
 @interface CBLDocument () <CBLCacheable>
 - (instancetype) initWithDatabase: (CBLDatabase*)database
-                       documentID: (NSString*)docID                 __attribute__((nonnull));
+                       documentID: (NSString*)docID
+                           exists: (BOOL)exists                     __attribute__((nonnull));
 - (CBLSavedRevision*) revisionFromRev: (CBL_Revision*)rev;
-- (void) revisionAdded: (CBLDatabaseChange*)change                 __attribute__((nonnull));
+- (void) revisionAdded: (CBLDatabaseChange*)change
+                notify: (BOOL)notify                                __attribute__((nonnull));
+- (void) forgetCurrentRevision;
 - (void) loadCurrentRevisionFrom: (CBLQueryRow*)row                 __attribute__((nonnull));
 - (CBLSavedRevision*) putProperties: (NSDictionary*)properties
                      prevRevID: (NSString*)prevID
@@ -65,9 +92,11 @@
                          revision: (CBL_Revision*)rev               __attribute__((nonnull(2)));
 - (instancetype) initWithDatabase: (CBLDatabase*)tddb
                          revision: (CBL_Revision*)rev               __attribute__((nonnull));
+- (instancetype) initForValidationWithDatabase: (CBLDatabase*)db
+                                      revision: (CBL_Revision*)rev
+                              parentRevisionID: (NSString*)parentRevID __attribute__((nonnull));
 @property (readonly) CBL_Revision* rev;
 @property (readonly) BOOL propertiesAreLoaded;
-- (void) _setParentRevisionID: (NSString*)parentRevID;
 @end
 
 
@@ -104,23 +133,36 @@
 @end
 
 
+@interface CBLQueryEnumerator ()
++ (NSSortDescriptor*) asNSSortDescriptor: (id)descOrStr; // Converts NSString to NSSortDescriptor
+@end
+
+
+@protocol CBL_QueryRowStorage;
+
 @interface CBLQueryRow ()
 - (instancetype) initWithDocID: (NSString*)docID
                       sequence: (SequenceNumber)sequence
                            key: (id)key
                          value: (id)value
-                 docProperties: (NSDictionary*)docProperties;
+                   docRevision: (CBL_Revision*)docRevision
+                       storage: (id<CBL_QueryRowStorage>)storage;
+@property (readwrite, nonatomic) CBLDatabase* database;
+@property (readonly, nonatomic) id<CBL_QueryRowStorage> storage;
 @property (readonly, nonatomic) NSDictionary* asJSONDictionary;
+@property (readonly, nonatomic) CBL_Revision* documentRevision;
 @end
+
 
 @interface CBLFullTextQueryRow ()
 - (instancetype) initWithDocID: (NSString*)docID
                       sequence: (SequenceNumber)sequence
                     fullTextID: (UInt64)fullTextID
-                  matchOffsets: (NSString*)matchOffsets
-                         value: (id)value;
-@property (nonatomic) NSString* snippet;
+                         value: (id)value
+                       storage: (id<CBL_QueryRowStorage>)storage;
+- (void) addTerm: (NSUInteger)term atRange: (NSRange)range;
 @end
+
 
 @interface CBLGeoQueryRow ()
 - (instancetype) initWithDocID: (NSString*)docID
@@ -128,8 +170,11 @@
                    boundingBox: (CBLGeoRect)bbox
                    geoJSONData: (NSData*)geoJSONData
                          value: (NSData*)valueData
-                 docProperties: (NSDictionary*)docProperties;
+                   docRevision: (CBL_Revision*)docRevision
+                       storage: (id<CBL_QueryRowStorage>)storage;
 @end
+
+NSString* CBLKeyPathForQueryRow(NSString* keyPath); // for testing
 
 
 @interface CBLReplication ()
@@ -140,4 +185,13 @@
                            remote: (NSURL*)remote
                              pull: (BOOL)pull                       __attribute__((nonnull));
 @property (nonatomic, readonly) NSDictionary* properties;
+@end
+
+
+@interface CBLModelFactory ()
+- (CBLQueryBuilder*) queryBuilderForClass: (Class)klass
+                                 property: (NSString*)property;
+- (void) setQueryBuilder: (CBLQueryBuilder*)builder
+                forClass: (Class)klass
+                property: (NSString*)property;
 @end

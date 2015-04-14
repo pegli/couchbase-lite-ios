@@ -31,6 +31,7 @@ static const struct StatusMapEntry kStatusMap[] = {
     {kCBLStatusUnauthorized,         401, "unauthorized"},
     {kCBLStatusNotFound,             404, "not_found"},
     {kCBLStatusForbidden,            403, "forbidden"},
+    {kCBLStatusMethodNotAllowed,     405, "method_not_allowed"},
     {kCBLStatusNotAcceptable,        406, "not_acceptable"},
     {kCBLStatusConflict,             409, "conflict"},
     {kCBLStatusDuplicate,            412, "file_exists"},      // really 'Precondition Failed'
@@ -88,11 +89,21 @@ NSError* CBLStatusToNSError( CBLStatus status, NSURL* url ) {
 }
 
 
+BOOL ReturnNSErrorFromCBLStatus( CBLStatus status, NSError** outError) {
+    if (!CBLStatusIsError(status))
+        return YES;
+    if (outError)
+        *outError = CBLStatusToNSError(status, nil);
+    return NO;
+}
+
 
 CBLStatus CBLStatusFromNSError(NSError* error, CBLStatus defaultStatus) {
+    NSInteger code = error.code;
     if (!error)
         return kCBLStatusOK;
-    if (!$equal(error.domain, CBLHTTPErrorDomain))
+    else if ($equal(error.domain, CBLHTTPErrorDomain))
+        return (CBLStatus)code;
+    else
         return defaultStatus;
-    return (CBLStatus)error.code;
 }

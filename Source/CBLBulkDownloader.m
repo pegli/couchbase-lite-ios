@@ -17,7 +17,7 @@
 #import "CBLBulkDownloader.h"
 #import "CBLMultipartReader.h"
 #import "CBLMultipartDocumentReader.h"
-#import "CBL_Puller.h"
+#import "CBLRestPuller.h"
 #import "CBL_Revision.h"
 #import "CBLDatabase+Internal.h"
 #import "CBLMisc.h"
@@ -48,10 +48,10 @@
 {
     // Build up a JSON body describing what revisions we want:
     NSArray* keys = [revs my_map: ^(CBL_Revision* rev) {
-        NSArray* attsSince = [_db.storage getPossibleAncestorRevisionIDs: rev
+        NSArray* attsSince = [database.storage getPossibleAncestorRevisionIDs: rev
                                                            limit: kMaxNumberOfAttsSince
                                                  onlyAttachments: YES];
-        if (!attsSince.count == 0)
+        if (attsSince.count == 0)
             attsSince = nil;
         return $dict({@"id", rev.docID},
                      {@"rev", rev.revID},

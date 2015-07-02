@@ -7,6 +7,7 @@
 //
 
 #import "CBLTestCase.h"
+#import "CBLInternal.h"
 #import "MYBlockUtils.h"
 
 
@@ -481,15 +482,19 @@
                    context: NULL];
 
     NSDate* timeout = [NSDate dateWithTimeIntervalSinceNow: 2.0];
+    CFAbsoluteTime lastUpdateTime = 0;
     while (timeout.timeIntervalSinceNow > 0.0) {
         @autoreleasepool {
             if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
-                                          beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.05]])
+                                          beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.025]])
                 break;
-            usleep(50 * 1000); // throttle the loop so we don't add docs too fast
-            NSDictionary* properties = @{@"testName": @"testDatabase", @"sequence": @(i++)};
-            [self createDocumentWithProperties: properties];
-            //Log(@"%% Created doc #%u", i-1);
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if ( now - lastUpdateTime >= .050) { // throttle the loop so we don't add docs too fast
+                NSDictionary* properties = @{@"testName": @"testDatabase", @"sequence": @(i++)};
+                [self createDocumentWithProperties: properties];
+                //Log(@"%% Created doc #%u", i-1);
+                lastUpdateTime = now;
+            }
         }
     }
     [query stop];
@@ -709,11 +714,6 @@
 }
 
 - (void) test14_LiveQuery_AddingNonIndexedDocsPriorCreatingLiveQuery {
-//    [CBLManager enableLogging:@"CBLDatabase"];
-//    [CBLManager enableLogging:@"Query"];
-//    [CBLManager enableLogging:@"View"];
-//    [CBLManager enableLogging:@"ViewVerbose"];
-
     CBLView* view = [db viewNamed: @"vu"];
 
     [view setMapBlock: MAPBLOCK({
@@ -779,6 +779,64 @@
 }
 
 
+- (void) test15_LiveQueryAllDocs {
+    [self createDocuments: 10];
+    CBLQuery *allDocsQuery = [db createAllDocumentsQuery];
+    CBLLiveQuery *allDocsQueryLive = [allDocsQuery asLiveQuery];
+    [allDocsQueryLive start];
+    Assert([allDocsQueryLive waitForRows]);
+
+    CBLQueryEnumerator* rows = allDocsQueryLive.rows;
+    AssertEq(rows.count, 10u);
+    for (CBLQueryRow* row in rows) {
+        Log(@"-- %@", row);
+        CBLDocument* doc = row.document;
+        Assert(doc != nil, @"Couldn't get document of %@", row);    // Test fix for #733
+    }
+}
+
+
+- (void) test16_LiveQuery_BackgroundUpdate {
+    CBLView* view = [db viewNamed: @"vu"];
+
+    [view setMapBlock: MAPBLOCK({
+        emit(doc[@"sequence"], nil);
+    }) version: @"1"];
+
+    // Create a document:
+    [self createDocumentWithProperties: @{@"sequence": @(0)} inDatabase: db];
+
+    CBLQuery* query = [view createQuery];
+    CBLQueryEnumerator* rows = [query run: NULL];
+    AssertEq(rows.count, 1u);
+
+    CBLLiveQuery* liveQuery = [query asLiveQuery];
+    [self keyValueObservingExpectationForObject: liveQuery
+                                        keyPath: @"rows"
+                                        handler: ^BOOL(id object, NSDictionary *change) {
+         return (((CBLLiveQuery*)object).rows.count == 10);
+     }];
+    [liveQuery start];
+
+    // Create more documents in background:
+    [dbmgr backgroundTellDatabaseNamed: db.name to: ^(CBLDatabase* bgdb) {
+        [bgdb inTransaction: ^BOOL{
+            for (unsigned i=1; i<10; i++) {
+                @autoreleasepool {
+                    [self createDocumentWithProperties: @{@"sequence": @(i)} inDatabase: bgdb];
+                }
+            }
+            return YES;
+        }];
+    }];
+
+    [self waitForExpectationsWithTimeout: 2.0 handler: ^(NSError *error) {
+        AssertNil(error, @"Live query timed out!");
+    }];
+    
+    [liveQuery stop];
+}
+
 #pragma mark - GEO
 
 
@@ -812,7 +870,7 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
     ];
 }
 
-- (void) test15_GeoQuery {
+- (void) test17_GeoQuery {
     if (!self.isSQLiteDB)
         return;     //FIX: Geo support in ForestDB is not complete enough to pass this test
 
@@ -875,7 +933,7 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
 
 // Make sure that a database's map/reduce functions are shared with the shadow database instance
 // running in the background server.
-- (void) test16_SharedMapBlocks {
+- (void) test18_SharedMapBlocks {
     [db setFilterNamed: @"phil" asBlock: ^BOOL(CBLSavedRevision *revision, NSDictionary *params) {
         return YES;
     }];
@@ -909,7 +967,7 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
 }
 
 
-- (void) test17_CBLKeyPathForQueryRow {
+- (void) test19_CBLKeyPathForQueryRow {
     AssertEqual(CBLKeyPathForQueryRow(@"value"),           @"value");
     AssertEqual(CBLKeyPathForQueryRow(@"value.foo"),       @"value.foo");
     AssertEqual(CBLKeyPathForQueryRow(@"value[0]"),        @"value0");
@@ -926,7 +984,7 @@ static NSDictionary* mkGeoRect(double x0, double y0, double x1, double y1) {
 }
 
 
-- (void) test18_DocTypes {
+- (void) test20_DocTypes {
     CBLView* view1 = [db viewNamed: @"test/peepsNames"];
     view1.documentType = @"person";
     [view1 setMapBlock: MAPBLOCK({

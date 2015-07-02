@@ -95,8 +95,7 @@ NSString* const kCBLDocumentChangeNotification = @"CBLDocumentChange";
 - (BOOL) purgeDocument: (NSError**)outError {
     CBLStatus status = [_database.storage purgeRevisions: @{self.documentID : @[@"*"]} result: nil];
     if (CBLStatusIsError(status)) {
-        if (outError)
-            *outError = CBLStatusToNSError(status, nil);
+        CBLStatusToOutNSError(status, outError);
         return NO;
     }
     [_database removeDocumentFromCache: self];
@@ -234,6 +233,14 @@ NSString* const kCBLDocumentChangeNotification = @"CBLDocumentChange";
 }
 
 
+- (NSArray*) getPossibleAncestorsOfRevisionID: (NSString*)revID limit: (NSUInteger)limit {
+    CBL_Revision* rev = [[CBL_Revision alloc] initWithDocID: _docID revID: revID deleted: NO];
+    return [_database.storage getPossibleAncestorRevisionIDs: rev
+                                                       limit: (unsigned)limit
+                                             onlyAttachments: NO];
+}
+
+
 #pragma mark - PROPERTIES:
 
 
@@ -278,11 +285,12 @@ NSString* const kCBLDocumentChangeNotification = @"CBLDocumentChange";
                                     properties: nuProperties
                                 prevRevisionID: prevID
                                  allowConflict: allowConflict
-                                        status: &status];
-    if (!newRev) {
-        if (outError) *outError = CBLStatusToNSError(status, nil);
+                                        source: nil
+                                        status: &status
+                                         error: outError];
+    if (!newRev)
         return nil;
-    }
+    
     return [self revisionFromRev: newRev];
 }
 

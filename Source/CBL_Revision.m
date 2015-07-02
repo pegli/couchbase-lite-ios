@@ -182,6 +182,11 @@
     return CBLSequenceCompare(_sequence, rev->_sequence);
 }
 
+- (NSComparisonResult) compareSequencesDescending: (CBL_Revision*)rev {
+    NSParameterAssert(rev != nil);
+    return CBLSequenceCompare(_sequence, rev->_sequence) * -1;
+}
+
 - (CBL_MutableRevision*) mutableCopyWithDocID: (UU NSString*)docID revID: (UU NSString*)revID {
     CBL_MutableRevision* rev = [self mutableCopy];
     [rev setDocID: docID revID: revID];
@@ -226,13 +231,13 @@
                 return YES;
             } else {
                 Log(@"CBLDatabase: Invalid top-level key '%@' in document to be inserted", key);
-                return ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
+                return CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
             }
         };
     });
 
     if (!properties) {
-        ReturnNSErrorFromCBLStatus(kCBLStatusBadJSON, outError);
+        CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
         return nil;
     }
 
@@ -378,6 +383,10 @@
     return self;
 }
 
+- (instancetype) mutableCopyWithZone: (NSZone*)zoneIgnored {
+    return [[[self class] alloc] initWithArray: _revs];
+}
+
 
 - (NSString*) description {
     return _revs.description;
@@ -399,6 +408,10 @@
 
 - (void) removeRev: (CBL_Revision*)rev {
     [_revs removeObject: rev];
+}
+
+- (void) removeRevIdenticalTo: (CBL_Revision*)rev {
+    [_revs removeObjectIdenticalTo: rev];
 }
 
 - (CBL_Revision*) removeAndReturnRev: (CBL_Revision*)rev {
@@ -454,8 +467,11 @@
         [_revs removeObjectsInRange: NSMakeRange(limit, _revs.count - limit)];
 }
 
-- (void) sortBySequence {
-    [_revs sortUsingSelector: @selector(compareSequences:)];
+- (void) sortBySequenceAscending:(BOOL)ascending {
+    if (ascending)
+        [_revs sortUsingSelector: @selector(compareSequences:)];
+    else
+        [_revs sortUsingSelector: @selector(compareSequencesDescending:)];
 }
 
 - (void) sortByDocID {

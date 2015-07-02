@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <Security/SecBase.h>
 @class CBLHTTPServer, CBLManager;
+@protocol CBLListenerDelegate;
 
 
 /** A simple HTTP server that provides remote access to the CouchbaseLite REST API. */
@@ -23,11 +24,18 @@
     If the listener has not yet started, this will return 0. */
 @property (readonly) UInt16 port;
 
+@property (weak) id<CBLListenerDelegate> delegate;
 
-/** The Bonjour service name and type to advertise as.
+
+/** Sets the Bonjour service name and type to advertise as.
     @param name  The service name; this can be arbitrary but is generally the device user's name. An empty string will be mapped to the device's name.
     @param type  The service type; the type of a generic HTTP server is "_http._tcp." but you should use something more specific. */
 - (void) setBonjourName: (NSString*)name type: (NSString*)type;
+
+/** The published Bonjour service name. Nil until the server has started. Usually this is the same
+    as the name you specified in -setBonjourName:type:, but if there's
+    already a service with the same name on the network, your name may have a suffix appended. */
+@property (readonly) NSString* bonjourName;
 
 /** Bonjour metadata associated with the service. Changes will be visible almost immediately.
     The keys are NSStrings and values are NSData. Total size should be kept small (under 1kbyte if possible) as this data is multicast over UDP. */
@@ -95,5 +103,29 @@
 
 /** Stops the listener. */
 - (void) stop;
+
+@end
+
+
+
+@protocol CBLListenerDelegate <NSObject>
+@optional
+
+/** Authenticates a connection with an SSL client certificate.
+    If this method is not implemented, any client cert is accepted.
+    @param address  The IP address of the peer.
+    @param trust  An already-evaluated SecTrustRef. You can look at its result and certificate
+                    chain to make your decision.
+    @return  A user name, or nil to reject the connection. If you don't use user names in your
+                    app, just return an empty string. */
+- (NSString*) authenticateConnectionFromAddress: (NSData*)address
+                                      withTrust: (SecTrustRef)trust;
+
+/** Authenticates a request that uses Basic or Digest authentication.
+    If this method is not implemented, the `passwords` dictionary registered with the CBLListener
+    is consulted instead.
+    @param username  The user name presented by the client.
+    @return  The password for this user, or nil to reject the request. */
+- (NSString*) passwordForUser: (NSString*)username;
 
 @end

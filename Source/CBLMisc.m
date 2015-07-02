@@ -19,6 +19,7 @@
 #import "CollectionUtils.h"
 #import "CBJSONEncoder.h"
 #import "CBLJSON.h"
+#import <netdb.h>
 
 
 #ifdef GNUSTEP
@@ -99,7 +100,7 @@ NSString* CBLCreateUUID() {
     [uuid replaceOccurrencesOfString: @"+" withString: @"-" options: 0 range: NSMakeRange(0, 22)];
     // prefix a '!' to make it more clear where this string came from and prevent having a leading
     // '_' character:
-    [uuid insertString: @"!" atIndex: 0];
+    [uuid insertString: @"-" atIndex: 0];
     return uuid;
 }
 
@@ -296,13 +297,21 @@ BOOL CBLParseInteger(NSString* str, NSInteger* outInt) {
 BOOL CBLIsOfflineError( NSError* error ) {
     NSString* domain = error.domain;
     NSInteger code = error.code;
-    if ($equal(domain, NSURLErrorDomain))
+    if ($equal(domain, NSURLErrorDomain)) {
         return code == NSURLErrorDNSLookupFailed
             || code == NSURLErrorNotConnectedToInternet
 #ifndef GNUSTEP
             || code == NSURLErrorInternationalRoamingOff
 #endif
         ;
+    } else if ($equal(domain, (__bridge id)kCFErrorDomainCFNetwork)) {
+        if (code == kCFHostErrorUnknown) {
+            int netdbCode = [error.userInfo[(__bridge id)kCFGetAddrInfoFailureKey] intValue];
+            return netdbCode == EAI_NONAME;
+        } else {
+            return code == kCFHostErrorHostNotFound;
+        }
+    }
     return NO;
 }
 
@@ -334,6 +343,9 @@ BOOL CBLMayBeTransientError( NSError* error ) {
     if ($equal(domain, NSURLErrorDomain)) {
         return code == NSURLErrorTimedOut || code == NSURLErrorCannotConnectToHost
                                           || code == NSURLErrorNetworkConnectionLost;
+    } else if ($equal(domain, NSPOSIXErrorDomain)) {
+        return code == ENETDOWN || code == ENETUNREACH || code == ENETRESET || code == ECONNABORTED
+            || code == ECONNRESET || code == ETIMEDOUT || code == ECONNREFUSED;
     } else if ($equal(domain, CBLHTTPErrorDomain)) {
         // Internal Server Error, Bad Gateway, Service Unavailable or Gateway Timeout:
         return code == 500 || code == 502 || code == 503 || code == 504;
@@ -402,6 +414,23 @@ BOOL CBLRemoveFileIfExistsAsync(NSString* path, NSError** outError) {
     }
 }
 
+
+BOOL CBLCopyFileIfExists(NSString* atPath, NSString* toPath, NSError** outError) {
+    NSFileManager *fmgr = [NSFileManager defaultManager];
+    if ([fmgr fileExistsAtPath:atPath isDirectory:NULL]) {
+        NSError *error;
+        if ([fmgr copyItemAtPath: atPath toPath: toPath error: &error])
+            return YES;
+        else {
+            if (outError)
+                *outError = error;
+            return NO;
+        }
+    } else
+        return YES;
+}
+
+
 NSString* CBLGetHostName() {
     // From <http://stackoverflow.com/a/16902907/98077>
     char baseHostName[256];
@@ -456,4 +485,25 @@ NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) {
         [urlStr appendString: @"/"];
     [urlStr appendString: toAppend];
     return [NSURL URLWithString: urlStr];
+}
+
+
+id CBLKeyForPrefixMatch(id key, unsigned depth) {
+    if (depth < 1)
+        return key;
+    if ([key isKindOfClass: [NSString class]]) {
+        // Kludge: prefix match a string by appending max possible character value to it
+        return [key stringByAppendingString: @"\uffffffff"];
+    } else if ([key isKindOfClass: [NSArray class]]) {
+        NSMutableArray* nuKey = [key mutableCopy];
+        if (depth == 1) {
+            [nuKey addObject: @{}];
+        } else {
+            id lastObject = CBLKeyForPrefixMatch(nuKey.lastObject, depth-1);
+            [nuKey replaceObjectAtIndex: nuKey.count-1 withObject: lastObject];
+        }
+        return nuKey;
+    } else {
+        return key;
+    }
 }

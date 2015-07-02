@@ -17,6 +17,7 @@ extern "C" {
 #import "CBL_ForestDBStorage.h"
 #import "CBL_ForestDBViewStorage.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBL_BlobStore.h"
 #import "CBL_Attachment.h"
 #import "CBLBase64.h"
@@ -109,7 +110,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
                   error: (NSError**)outError
 {
     if (_delegate.encryptionKey)
-        return ReturnNSErrorFromCBLStatus(kCBLStatusNotImplemented, outError);
+        return CBLStatusToOutNSError(kCBLStatusNotImplemented, outError);
 
     _directory = [directory copy];
     NSString* forestPath = [directory stringByAppendingPathComponent: kDBFilename];
@@ -131,9 +132,9 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
     try {
         _forest = new Database(std::string(forestPath.fileSystemRepresentation), config);
     } catch (forestdb::error err) {
-        return ReturnNSErrorFromCBLStatus(CBLStatusFromForestDBStatus(err.status), outError);
+        return CBLStatusToOutNSError(CBLStatusFromForestDBStatus(err.status), outError);
     } catch (...) {
-        return ReturnNSErrorFromCBLStatus(kCBLStatusException, outError);
+        return CBLStatusToOutNSError(kCBLStatusException, outError);
     }
     return YES;
 }
@@ -177,7 +178,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
         _forest->compact();
         return kCBLStatusOK;
     }];
-    return ReturnNSErrorFromCBLStatus(status, outError);
+    return CBLStatusToOutNSError(status, outError);
 }
 
 
@@ -402,26 +403,13 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 }
     
 
-- (NSArray*) getRevisionHistory: (CBL_Revision*)rev {
-    NSString* docID = rev.docID;
-    NSString* revID = rev.revID;
-    Assert(revID && docID);
-    __block NSArray* history = nil;
-    [self _withVersionedDoc: docID do: ^(VersionedDocument& doc) {
-        history = [CBLForestBridge getRevisionHistory: doc.get(revID)];
-        return kCBLStatusOK;
-    }];
-    return history;
-}
-
-
-- (NSDictionary*) getRevisionHistoryDict: (CBL_Revision*)rev
-                       startingFromAnyOf: (NSArray*)ancestorRevIDs
+- (NSArray*) getRevisionHistory: (CBL_Revision*)rev
+                   backToRevIDs: (NSSet*)ancestorRevIDs
 {
-    __block NSDictionary* history = nil;
+    __block NSArray* history = nil;
     [self _withVersionedDoc: rev.docID do: ^(VersionedDocument& doc) {
         history = [CBLForestBridge getRevisionHistoryOfNode: doc.get(rev.revID)
-                                          startingFromAnyOf: ancestorRevIDs];
+                                               backToRevIDs: ancestorRevIDs];
         return kCBLStatusOK;
     }];
     return history;
@@ -436,14 +424,20 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
     // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
     // Translate options to ForestDB:
     if (!options) options = &kDefaultCBLChangesOptions;
+    
+    if (options->descending) {
+        // https://github.com/couchbase/couchbase-lite-ios/issues/641
+        *outStatus = kCBLStatusNotImplemented;
+        return nil;
+    }
+
     auto forestOpts = DocEnumerator::Options::kDefault;
     forestOpts.limit = options->limit;
     forestOpts.inclusiveEnd = YES;
     forestOpts.includeDeleted = NO;
-    BOOL includeDocs = options->includeDocs || options->includeConflicts || (filter != NULL);
-    if (!includeDocs)
+    BOOL withBody = (options->includeDocs || filter != nil);
+    if (!withBody)
         forestOpts.contentOptions = Database::kMetaOnly;
-    BOOL withBody = (includeDocs || filter);
 
     CBL_RevisionList* changes = [[CBL_RevisionList alloc] init];
     *outStatus = [self _try: ^CBLStatus{
@@ -451,17 +445,23 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
             @autoreleasepool {
                 VersionedDocument doc(*_forest, *e);
                 NSArray* revIDs;
-                if (options->includeConflicts)
+                if (options->includeConflicts && doc.isConflicted()) {
+                    if (forestOpts.contentOptions & Database::kMetaOnly)
+                        doc.read();
                     revIDs = [CBLForestBridge getCurrentRevisionIDs: doc];
-                else
+                } else {
                     revIDs = @[(NSString*)doc.revID()];
+                }
                 for (NSString* revID in revIDs) {
                     CBL_MutableRevision* rev = [CBLForestBridge revisionObjectFromForestDoc: doc
                                                                                       revID: revID
                                                                                withBody: withBody];
                     Assert(rev);
-                    if (!filter || filter(rev))
+                    if (!filter || filter(rev)) {
+                        if (!options->includeDocs)
+                            rev.body = nil;
                         [changes addRev: rev];
+                    }
                 }
             }
         }
@@ -493,9 +493,17 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
             docIDs.push_back(docID.UTF8String);
         e = DocEnumerator(*_forest, docIDs, forestOpts);
     } else {
+        id startKey, endKey;
+        if (options->descending) {
+            startKey = CBLKeyForPrefixMatch(options.startKey, options->prefixMatchLevel);
+            endKey = options.endKey;
+        } else {
+            startKey = options.startKey;
+            endKey = CBLKeyForPrefixMatch(options.endKey, options->prefixMatchLevel);
+        }
         e = DocEnumerator(*_forest,
-                          nsstring_slice(options.startKey),
-                          nsstring_slice(options.endKey),
+                          nsstring_slice(startKey),
+                          nsstring_slice(endKey),
                           forestOpts);
     }
 
@@ -582,19 +590,19 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
 - (BOOL) findMissingRevisions: (CBL_RevisionList*)revs
                        status: (CBLStatus*)outStatus
 {
-    [revs sortByDocID];
+    CBL_RevisionList* sortedRevs = [revs mutableCopy];
+    [sortedRevs sortByDocID];
     __block VersionedDocument* doc = NULL;
     *outStatus = [self _try: ^CBLStatus {
         NSString* lastDocID = nil;
-        for (NSInteger i = revs.count-1; i >= 0; i--) {
-            CBL_Revision* rev = revs[i];
+        for (CBL_Revision* rev in sortedRevs) {
             if (!$equal(rev.docID, lastDocID)) {
                 lastDocID = rev.docID;
                 delete doc;
                 doc = new VersionedDocument(*_forest, lastDocID);
             }
             if (doc && doc->get(rev.revID) != NULL)
-                [revs removeObjectAtIndex: i];
+                [revs removeRevIdenticalTo: rev];
         }
         return kCBLStatusOK;
     }];
@@ -639,7 +647,7 @@ static void FDBLogCallback(forestdb::logLevel level, const char *message) {
         return kCBLStatusOK;
     }];
     if (CBLStatusIsError(status)) {
-        ReturnNSErrorFromCBLStatus(status, outError);
+        CBLStatusToOutNSError(status, outError);
         keys = nil;
     }
     return keys;
@@ -874,9 +882,14 @@ static void convertRevIDs(NSArray* revIDs,
              allowConflict: (BOOL)allowConflict
            validationBlock: (CBL_StorageValidationBlock)validationBlock
                     status: (CBLStatus*)outStatus
+                     error: (NSError **)outError
 {
+    if (outError)
+        *outError = nil;
+
     if (_forest->isReadOnly()) {
         *outStatus = kCBLStatusForbidden;
+        CBLStatusToOutNSError(*outStatus, outError);
         return nil;
     }
 
@@ -885,6 +898,7 @@ static void convertRevIDs(NSArray* revIDs,
         json = [CBL_Revision asCanonicalJSON: properties error: NULL];
         if (!json) {
             *outStatus = kCBLStatusBadJSON;
+            CBLStatusToOutNSError(*outStatus, outError);
             return nil;
         }
     } else {
@@ -963,7 +977,8 @@ static void convertRevIDs(NSArray* revIDs,
                                                         revID: prevRevID
                                                       deleted: revNode->isDeleted()];
             }
-            CBLStatus status = validationBlock(putRev, prevRev, prevRevID);
+
+            CBLStatus status = validationBlock(putRev, prevRev, prevRevID, outError);
             if (CBLStatusIsError(status))
                 return status;
         }
@@ -992,8 +1007,12 @@ static void convertRevIDs(NSArray* revIDs,
         return (CBLStatus)status;
     }];
 
-    if (CBLStatusIsError(*outStatus))
+    if (CBLStatusIsError(*outStatus)) {
+        // Check if the outError has a value to not override the validation error:
+        if (outError && !*outError)
+            CBLStatusToOutNSError(*outStatus, outError);
         return nil;
+    }
     [_delegate databaseStorageChanged: change];
     return putRev;
 }
@@ -1004,13 +1023,21 @@ static void convertRevIDs(NSArray* revIDs,
           revisionHistory: (NSArray*)history
           validationBlock: (CBL_StorageValidationBlock)validationBlock
                    source: (NSURL*)source
+                    error: (NSError **)outError
 {
-    if (_forest->isReadOnly())
+    if (outError)
+        *outError = nil;
+
+    if (_forest->isReadOnly()) {
+        CBLStatusToOutNSError(kCBLStatusForbidden, outError);
         return kCBLStatusForbidden;
+    }
 
     NSData* json = inRev.asCanonicalJSON;
-    if (!json)
+    if (!json) {
+        CBLStatusToOutNSError(kCBLStatusBadJSON, outError);
         return kCBLStatusBadJSON;
+    }
 
     __block CBLDatabaseChange* change = nil;
 
@@ -1041,7 +1068,7 @@ static void convertRevIDs(NSArray* revIDs,
                                                    deleted: deleted];
             }
             NSString* parentRevID = (history.count > 1) ? history[1] : nil;
-            CBLStatus status = validationBlock(inRev, prev, parentRevID);
+            CBLStatus status = validationBlock(inRev, prev, parentRevID, outError);
             if (CBLStatusIsError(status))
                 return status;
         }
@@ -1063,6 +1090,12 @@ static void convertRevIDs(NSArray* revIDs,
 
     if (change)
         [_delegate databaseStorageChanged: change];
+
+    if (CBLStatusIsError(status)) {
+        // Check if the outError has a value to not override the validation error:
+        if (outError && !*outError)
+            CBLStatusToOutNSError(status, outError);
+    }
     return status;
 }
 

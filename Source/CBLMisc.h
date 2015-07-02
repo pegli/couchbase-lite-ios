@@ -7,7 +7,10 @@
 //
 
 #import <Foundation/Foundation.h>
-#import "CBL_Revision.h"
+
+
+/** Database sequence ID */
+typedef SInt64 SequenceNumber;
 
 
 // In a method/function implementation (not declaration), declaring an object parameter as
@@ -93,6 +96,9 @@ BOOL CBLRemoveFileIfExists(NSString* path, NSError** outError) __attribute__((no
    The file will be moved to the temp folder and renamed before it is deleted. */
 BOOL CBLRemoveFileIfExistsAsync(NSString* path, NSError** outError);
 
+/* Copy a file if it exists; does nothing if it doesn't. */
+BOOL CBLCopyFileIfExists(NSString*atPath, NSString* toPath, NSError** outError) __attribute__((nonnull(1, 2)));
+
 /** Returns the hostname of this computer/device (will be of the form "___.local") */
 NSString* CBLGetHostName(void);
 
@@ -102,6 +108,8 @@ NSURL* CBLURLWithoutQuery( NSURL* url ) __attribute__((nonnull));
 /** Appends path components to a URL. These will NOT be URL-escaped, so you can include queries. */
 NSURL* CBLAppendToURL(NSURL* baseURL, NSString* toAppend) __attribute__((nonnull));
 
+/** Changes a given query max key into one that also extends to any key it matches as a prefix. */
+id CBLKeyForPrefixMatch(id key, unsigned depth);
 
 #if DEBUG
 NSString* CBLPathToTestFile(NSString* name);

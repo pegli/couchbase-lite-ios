@@ -24,11 +24,18 @@
 
 #import "HTTPMessage.h"
 #import "HTTPDataResponse.h"
+#import "GCDAsyncSocket.h"
 
+#import "MYErrorUtils.h"
 #import "Test.h"
 
 
 @implementation CBLHTTPConnection
+{
+    BOOL _hasClientCert;
+}
+
+@synthesize username=_username;
 
 
 - (CBLListener*) listener {
@@ -36,16 +43,53 @@
 }
 
 
+- (SSLAuthenticate)sslClientSideAuthentication {
+    return kTryAuthenticate;
+}
+
+- (void)socket:(GCDAsyncSocket *)sock
+        didReceiveTrust:(SecTrustRef)trust
+        completionHandler:(void (^)(BOOL shouldTrustPeer))completionHandler
+{
+    // This only gets called if the SSL settings disable regular cert validation.
+    SecTrustEvaluateAsync(trust, dispatch_get_main_queue(),
+                          ^(SecTrustRef trustRef, SecTrustResultType result)
+    {
+        LogTo(CBLListener, @"Login attempted with client cert; trust result = %d", result);
+        id<CBLListenerDelegate> delegate = self.listener.delegate;
+        BOOL ok;
+        if (result == kSecTrustResultDeny || result == kSecTrustResultFatalTrustFailure
+                                          || result == kSecTrustResultOtherError) {
+            ok = NO;
+        } else if ([delegate respondsToSelector: @selector(authenticateConnectionFromAddress:withTrust:)]) {
+            _username = [delegate authenticateConnectionFromAddress: sock.connectedAddress
+                                                          withTrust: trust];
+            ok = (_username != nil);
+        } else {
+            ok = (result == kSecTrustResultProceed || result == kSecTrustResultUnspecified);
+        }
+        _hasClientCert = ok;
+        completionHandler(ok);
+    });
+}
+
 - (BOOL)isPasswordProtected:(NSString *)path {
-    return self.listener.requiresAuth;
+    return !_hasClientCert && self.listener.requiresAuth;
 }
 
 - (NSString*) realm {
     return self.listener.realm;
 }
 
+- (BOOL)useDigestAccessAuthentication {
+    // CBL/.NET doesn't support digest auth on the client side, so turn it off, as long as the
+    // connection is SSL (Basic auth is too insecure to use over an unencrypted connection.) #784
+    return !self.isSecureServer;
+}
+
 - (NSString*) passwordForUser: (NSString*)username {
     LogTo(CBLListener, @"Login attempted for user '%@'", username);
+    _username = username;
     return [self.listener passwordForUser: username];
 }
 
@@ -58,7 +102,14 @@
     NSArray* certs = self.listener.SSLExtraCertificates;
     if (certs.count)
         [result addObjectsFromArray: certs];
+    LogTo(CBLListener, @"Using SSL identity/certs %@", result);
     return result;
+}
+
+
+- (void) socketDidDisconnect: (GCDAsyncSocket*)socket withError: (NSError*)error {
+    if (![error my_hasDomain: GCDAsyncSocketErrorDomain code: GCDAsyncSocketClosedError])
+        Warn(@"CBLHTTPConnection: Client disconnected: %@", error);
 }
 
 
@@ -88,6 +139,10 @@
                                                 request: urlRequest
                                                 isLocal: NO];
     router.processRanges = NO;  // The HTTP server framework does this already
+    if (_username) {
+        NSString* str = [@"user:" stringByAppendingString: [_username stringByAddingPercentEscapesUsingEncoding: NSUTF8StringEncoding]];
+        router.source = [NSURL URLWithString: str];
+    }
     CBLHTTPResponse* response = [[CBLHTTPResponse alloc] initWithRouter: router
                                                          forConnection: self];
     

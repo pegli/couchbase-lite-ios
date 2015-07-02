@@ -14,7 +14,7 @@
 //  and limitations under the License.
 
 #import "CBLQuery.h"
-#import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 #import "CBLView+Internal.h"
 #import "CBL_StorageTypes.h"
 
@@ -175,7 +175,8 @@
 
 
 - (void) reset {
-    Assert(!_usingIterator, @"Enumerator is not at start");
+    Assert(!_usingIterator, @"Sorry, the enumerator did not save up its rows so it cannot be "
+           "reset. Call -allObjects first thing to make the enumerator resettable.");
     _nextRow = 0;
 }
 

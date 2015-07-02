@@ -11,6 +11,15 @@
 extern NSString* const kCBLISErrorDomain;
 extern NSString* const kCBLISObjectHasBeenChangedInStoreNotification;
 
+/** Maximum number of relationship loading allowed in a fetch request. Default value is 3. */
+extern NSString* const kCBLISCustomPropertyMaxRelationshipLoadDepth;
+
+/** Enable query boolean value with number. After CBL 1.1.0, CBLIS stores a boolean value as
+ * a JSON boolean value instead of a number value of 1 or 0. If the application
+ * uses CBLIS and has stored boolean values since CBL 1.1.0 or below, setting this option to
+ * YES is required for quering data with boolean value predicates. Default value is NO. */
+extern NSString* const kCBLISCustomPropertyQueryBooleanWithNumber;
+
 /** Error codes for CBLIncrementalStore. */
 typedef enum
 {
@@ -61,6 +70,9 @@ typedef void(^CBLISConflictHandler)(NSArray* conflictingRevisions);
 
 /** Conflict handling block that gets called when conflicts are to be handled. Initialied with a generic conflicts handler, can be set to NULL to not handle conflicts at all. */
 @property (nonatomic, copy) CBLISConflictHandler conflictHandler;
+
+/** An optional dictionary of extra properties for the incremental store.*/
+@property (nonatomic, copy) NSDictionary* customProperties;
 
 /** Returns the type of this store to use with addPersistentStore:... 
  *

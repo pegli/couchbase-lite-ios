@@ -16,6 +16,7 @@
 #import "CBLDatabaseChange.h"
 #import "CBL_Revision.h"
 #import "CouchbaseLitePrivate.h"
+#import "CBLInternal.h"
 
 
 @implementation CBLDatabaseChange
@@ -31,6 +32,7 @@
                                 source: (NSURL*)source
 {
     Assert(addedRevision);
+    Assert(addedRevision.sequence);
     self = [super init];
     if (self) {
         // Input CBL_Revisions need to be copied in case they are mutable:
@@ -61,9 +63,10 @@
 }
 
 
-- (NSString*) documentID {return _addedRevision.docID;}
-
-- (NSString*) revisionID {return _addedRevision.revID;}
+- (NSString*) documentID    {return _addedRevision.docID;}
+- (NSString*) revisionID    {return _addedRevision.revID;}
+- (UInt64) sequenceNumber   {return _addedRevision.sequence;}
+- (BOOL) isDeletion         {return _addedRevision.deleted;}
 
 - (BOOL) isCurrentRevision {
     return _winningRevisionID && $equal(_addedRevision.revID, _winningRevisionID);

@@ -20,6 +20,7 @@
 #import "CBLDatabase.h"
 #import "CBL_Server.h"
 #import "CBLMisc.h"
+#import "CBLInternal.h"
 #import "MYBlockUtils.h"
 
 
@@ -128,7 +129,7 @@
             endKeyDocID=_endKeyDocID, indexUpdateMode=_indexUpdateMode, mapOnly=_mapOnly,
             database=_database, allDocsMode=_allDocsMode, sortDescriptors=_sortDescriptors,
             inclusiveStart=_inclusiveStart, inclusiveEnd=_inclusiveEnd, postFilter=_postFilter,
-            prefixMatchLevel=_prefixMatchLevel;
+            filterBlock=_filterBlock, prefixMatchLevel=_prefixMatchLevel;
 
 
 - (NSString*) description {
@@ -190,8 +191,10 @@
     options->indexUpdateMode = _indexUpdateMode;
     options->indexUpdateMode = _indexUpdateMode;
 
-    NSPredicate* postFilter = _postFilter;
-    if (postFilter) {
+    if (_filterBlock) {
+        options.filter = _filterBlock;
+    } else if (_postFilter) {
+        NSPredicate* postFilter = _postFilter;
         CBLDatabase* database = _database;
         options.filter = ^(CBLQueryRow* row) {
             row.database = database;    //FIX: What if this is called on another thread??
@@ -214,8 +217,7 @@
                                                   lastSequence: &lastSequence
                                                         status: &status];
     if (!iterator) {
-        if (outError)
-            *outError = CBLStatusToNSError(status, nil);
+        CBLStatusToOutNSError(status, outError);
         return nil;
     }
     CBLQueryEnumerator* result = [[CBLQueryEnumerator alloc] initWithDatabase: _database
@@ -270,7 +272,7 @@
             if (rows) {
                 // Associate the query rows with this view, not the background-thread one:
                 for (CBLQueryRow* row in rows)
-                    [row moveToView: _view];
+                    [row moveToDatabase: _database view: _view];
                 e = [[CBLQueryEnumerator alloc] initWithDatabase: _database
                                                             view: _view
                                                   sequenceNumber: lastSequence
@@ -278,7 +280,7 @@
                 if (_sortDescriptors)
                     [e sortUsingDescriptors: _sortDescriptors];
             } else if (CBLStatusIsError(status)) {
-                error = CBLStatusToNSError(status, nil);
+                error = CBLStatusToNSError(status);
             }
             onComplete(e, error);
         }];

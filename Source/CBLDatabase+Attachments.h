@@ -8,7 +8,7 @@
 
 #import "CBLDatabase+Internal.h"
 #import "CBL_BlobStore.h"
-@class CBL_Revision, CBLMultipartWriter, CBL_Attachment;
+@class CBL_Revision, CBL_Attachment;
 
 
 /** Types of encoding/compression of stored attachments. */
@@ -48,10 +48,6 @@ typedef enum {
                       decode: (BOOL)decodeAttachments
                       status: (CBLStatus*)outStatus;
 
-/** Generates a MIME multipart writer for a revision, with separate body parts for each attachment whose "follows" property is set. */
-- (CBLMultipartWriter*) multipartWriterForRevision: (CBL_Revision*)rev
-                                      contentType: (NSString*)contentType;
-
 /** Returns a CBL_Attachment for an attachment in a stored revision. */
 - (CBL_Attachment*) attachmentForRevision: (CBL_Revision*)rev
                                     named: (NSString*)filename
@@ -71,11 +67,19 @@ typedef enum {
 /** Updates or deletes an attachment, creating a new document revision in the process.
     Used by the PUT / DELETE methods called on attachment URLs. */
 - (CBL_Revision*) updateAttachment: (NSString*)filename
-                            body: (CBL_BlobStoreWriter*)body
-                            type: (NSString*)contentType
-                        encoding: (CBLAttachmentEncoding)encoding
-                         ofDocID: (NSString*)docID
-                           revID: (NSString*)oldRevID
-                          status: (CBLStatus*)outStatus;
+                              body: (CBL_BlobStoreWriter*)body
+                              type: (NSString*)contentType
+                          encoding: (CBLAttachmentEncoding)encoding
+                           ofDocID: (NSString*)docID
+                             revID: (NSString*)oldRevID
+                            source: (NSURL*)source
+                            status: (CBLStatus*)outStatus
+                             error: (NSError**)outError;
+
+- (void) rememberAttachmentWriter: (CBL_BlobStoreWriter*)writer;
+- (void) rememberAttachmentWritersForDigests: (NSDictionary*)writersByDigests;
+#if DEBUG
+- (id) attachmentWriterForAttachment: (NSDictionary*)attachment;
+#endif
 
 @end

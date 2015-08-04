@@ -23,6 +23,7 @@
 #import "CBLDatabase+Replication.h"
 #import "CBLMisc.h"
 #import "CBLRegisterJSViewCompiler.h"
+#import "CBLSyncListener.h"
 #import <Security/Security.h>
 
 #if DEBUG
@@ -162,6 +163,67 @@ static void usage(void) {
 }
 
 
+CBLManagerOptions options = {};
+const char* replArg = NULL, *user = NULL, *password = NULL, *realm = NULL;
+const char* identityName = NULL;
+BOOL auth = NO, useSSL = NO;
+
+
+static void startListener(CBLListener* listener) {
+    NSCAssert(listener!=nil, @"Couldn't create CBLListener");
+    listener.readOnly = options.readOnly;
+    
+    static id<CBLListenerDelegate> delegate;
+    if (!delegate)
+        delegate = [[ListenerDelegate alloc] init];
+    listener.delegate = delegate;
+
+    if (auth) {
+        srandomdev();
+        NSString* password = [NSString stringWithFormat: @"%lx", random()];
+        listener.passwords = @{@"cbl": password};
+        Log(@"Auth required: user='cbl', password='%@'", password);
+    }
+
+    if (useSSL) {
+        NSString* name;
+        if (identityName) {
+            name = [NSString stringWithUTF8String: identityName];
+            SecIdentityRef identity = SecIdentityCopyPreferred((__bridge CFStringRef)name, NULL, NULL);
+            if (!identity) {
+                Warn(@"FATAL: Couldn't find identity pref named '%@'", name);
+                exit(1);
+            }
+            listener.SSLIdentity = identity;
+            CFRelease(identity);
+        } else {
+            name = @"LiteServ";
+            NSError* error;
+            if (![listener setAnonymousSSLIdentityWithLabel: name error: &error]) {
+                Warn(@"FATAL: Couldn't get/create default SSL identity: %@",
+                     error.localizedDescription);
+                exit(1);
+            }
+        }
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            Log(@"Serving SSL as identity '%@' %@", name, listener.SSLIdentityDigest);
+        });
+    }
+
+    // Advertise via Bonjour, and set a TXT record just as an example:
+    [listener setBonjourName: @"LiteServ" type: @"_cbl._tcp."];
+    NSData* value = [@"value" dataUsingEncoding: NSUTF8StringEncoding];
+    listener.TXTRecordDictionary = @{@"Key": value};
+
+    NSError* error;
+    if (![listener start: &error]) {
+        Warn(@"Failed to start %@: %@", listener.class, error.localizedDescription);
+        exit(1);
+    }
+}
+
+
 int main (int argc, const char * argv[])
 {
     @autoreleasepool {
@@ -173,11 +235,8 @@ int main (int argc, const char * argv[])
         CBLRegisterJSViewCompiler();
 
         NSString* dataPath = nil;
-        UInt16 port = kPortNumber;
-        CBLManagerOptions options = {};
-        const char* replArg = NULL, *user = NULL, *password = NULL, *realm = NULL;
-        const char* identityName = NULL;
-        BOOL auth = NO, pull = NO, createTarget = NO, continuous = NO, useSSL = NO;
+        UInt16 port = kPortNumber, nuPort = 0;
+        BOOL pull = NO, createTarget = NO, continuous = NO;
 
         for (int i = 1; i < argc; ++i) {
             if (strcmp(argv[i], "--help") == 0) {
@@ -191,6 +250,10 @@ int main (int argc, const char * argv[])
                 const char *str = argv[++i];
                 char *end;
                 port = (UInt16)strtol(str, &end, 10);
+            } else if (strcmp(argv[i], "--nuport") == 0) {
+                const char *str = argv[++i];
+                char *end;
+                nuPort = (UInt16)strtol(str, &end, 10);
             } else if (strcmp(argv[i], "--readonly") == 0) {
                 options.readOnly = YES;
             } else if (strcmp(argv[i], "--auth") == 0) {
@@ -238,49 +301,14 @@ int main (int argc, const char * argv[])
 
         // Start a listener socket:
         CBLListener* listener = [[CBLListener alloc] initWithManager: server port: port];
-        NSCAssert(listener!=nil, @"Coudln't create CBLListener");
-        listener.readOnly = options.readOnly;
-        id<CBLListenerDelegate> delegate = [[ListenerDelegate alloc] init];
-        listener.delegate = delegate;
+        startListener(listener);
 
-        if (auth) {
-            srandomdev();
-            NSString* password = [NSString stringWithFormat: @"%lx", random()];
-            listener.passwords = @{@"cbl": password};
-            Log(@"Auth required: user='cbl', password='%@'", password);
-        }
-
-        if (useSSL) {
-            NSString* name;
-            if (identityName) {
-                name = [NSString stringWithUTF8String: identityName];
-                SecIdentityRef identity = SecIdentityCopyPreferred((__bridge CFStringRef)name, NULL, NULL);
-                if (!identity) {
-                    Warn(@"FATAL: Couldn't find identity pref named '%@'", name);
-                    exit(1);
-                }
-                listener.SSLIdentity = identity;
-                CFRelease(identity);
-            } else {
-                name = @"LiteServ";
-                NSError* error;
-                if (![listener setAnonymousSSLIdentityWithLabel: name error: &error]) {
-                    Warn(@"FATAL: Couldn't get/create default SSL identity: %@",
-                         error.localizedDescription);
-                    exit(1);
-                }
-            }
-            Log(@"Serving SSL as identity '%@' %@", name, listener.SSLIdentityDigest);
-        }
-
-        // Advertise via Bonjour, and set a TXT record just as an example:
-        [listener setBonjourName: @"LiteServ" type: @"_cbl._tcp."];
-        NSData* value = [@"value" dataUsingEncoding: NSUTF8StringEncoding];
-        listener.TXTRecordDictionary = @{@"Key": value};
-
-        if (![listener start: &error]) {
-            Warn(@"Failed to start HTTP listener: %@", error.localizedDescription);
-            exit(1);
+        CBLSyncListener* syncListener;
+        if (nuPort > 0) {
+            // New-replicator listener:
+            syncListener = [[CBLSyncListener alloc] initWithManager: server port: nuPort];
+            startListener(syncListener);
+            Log(@"Listening for BLIP replications at <%@>", syncListener.URL);
         }
 
         if (replArg) {

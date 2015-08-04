@@ -34,7 +34,20 @@
 #define RetryDelay(COUNT) (4 << (COUNT))        // COUNT starts at 0
 
 
+typedef enum {
+    kNoAuthChallenge,
+    kTryAuthorizer,
+    kTryProposed,
+    kFindCredential,
+    kGiveUp
+} AuthPhase;
+
+
 @implementation CBLRemoteRequest
+{
+    AuthPhase _authPhase;
+    NSURLCredential* _proposedCredential;
+}
 
 
 @synthesize delegate=_delegate, responseHeaders=_responseHeaders, cookieStorage=_cookieStorage;
@@ -88,8 +101,7 @@
 - (void) setAuthorizer: (id<CBLAuthorizer>)authorizer {
     if (_authorizer != authorizer) {
         _authorizer = authorizer;
-        [_request setValue: [authorizer authorizeURLRequest: _request forRealm: nil]
-        forHTTPHeaderField: @"Authorization"];
+        [$castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer) authorizeURLRequest: _request];
     }
 }
 
@@ -130,6 +142,7 @@
     if (!_request)
         return;     // -clearConnection already called
     _responseHeaders = nil;
+    _authPhase = kNoAuthChallenge;
     LogTo(RemoteRequest, @"%@: Starting...", self);
     Assert(!_connection);
     _connection = [NSURLConnection connectionWithRequest: _request delegate: self];
@@ -216,18 +229,43 @@
     if (!_autoRetry || _authorizer || _challenged)
         return false;
     _challenged = true;
-    NSURLCredential* cred = [_request.URL my_credentialForRealm: nil
-                                           authenticationMethod: NSURLAuthenticationMethodHTTPBasic];
-    if (!cred) {
+    CBLPasswordAuthorizer *auth = [[CBLPasswordAuthorizer alloc] initWithURL: _request.URL];
+    if (!auth) {
         LogTo(RemoteRequest, @"Got 401 but no stored credential found (with nil realm)");
         return false;
     }
 
     [_connection cancel];
-    self.authorizer = [[CBLBasicAuthorizer alloc] initWithCredential: cred];
-    LogTo(RemoteRequest, @"%@ retrying with %@", self, _authorizer);
+    self.authorizer = auth;
+    LogTo(RemoteRequest, @"%@ retrying with %@", self, auth);
     [self startAfterDelay: 0.0];
     return true;
+}
+
+
+- (NSURLCredential*) nextCredentialToTry: (NSURLAuthenticationChallenge*)challenge {
+    NSURLCredential* cred;
+    do {
+        switch (++_authPhase) {
+            case kTryAuthorizer:
+                _proposedCredential = challenge.proposedCredential;
+                cred = $castIf(CBLPasswordAuthorizer, _authorizer).credential;
+                break;
+            case kTryProposed:
+                cred = _proposedCredential;
+                _proposedCredential = nil;
+                break;
+            case kFindCredential: {
+                NSURLProtectionSpace* space = challenge.protectionSpace;
+                cred = [_request.URL my_credentialForRealm: space.realm
+                                      authenticationMethod: space.authenticationMethod];
+                break;
+            }
+            default:
+                return nil; // give up
+        }
+    } while (cred == nil || (cred.user && !cred.hasPassword));
+    return cred;
 }
 
 
@@ -268,25 +306,19 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     if ($equal(authMethod, NSURLAuthenticationMethodHTTPBasic) ||
             $equal(authMethod, NSURLAuthenticationMethodHTTPDigest)) {
         _challenged = true;
-        _authorizer = nil;
-        if (challenge.previousFailureCount <= 1) {
-            // On basic auth challenge, use proposed credential on first attempt. On second attempt
-            // or if there's no proposed credential, look one up. After that, give up.
-            NSURLCredential* cred = challenge.proposedCredential;
-            if (cred == nil || challenge.previousFailureCount > 0) {
-                cred = [_request.URL my_credentialForRealm: space.realm
-                                      authenticationMethod: authMethod];
-            }
-            if (cred) {
-                LogTo(RemoteRequest, @"    challenge: useCredential: %@", cred);
-                [sender useCredential: cred forAuthenticationChallenge:challenge];
-                // Update my authorizer so my owner (the replicator) can pick it up when I'm done
-                _authorizer = [[CBLBasicAuthorizer alloc] initWithCredential: cred];
-                return;
-            }
+        NSURLCredential* cred = [self nextCredentialToTry: challenge];
+        if (cred) {
+            LogTo(RemoteRequest, @"    challenge: (phase %d) useCredential: %@", _authPhase, cred);
+            [sender useCredential: cred forAuthenticationChallenge:challenge];
+            // Update my authorizer so my owner (the replicator) can pick it up when I'm done
+            if (_authPhase > kTryAuthorizer)
+                _authorizer = [[CBLPasswordAuthorizer alloc] initWithCredential: cred];
+            return;
+        } else {
+            _authorizer = nil;
+            LogTo(RemoteRequest, @"    challenge: (phase %d) continueWithoutCredential", _authPhase);
+            [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
         }
-        LogTo(RemoteRequest, @"    challenge: continueWithoutCredential");
-        [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
 
     } else if ($equal(authMethod, NSURLAuthenticationMethodServerTrust)) {
         // Verify the _server's_ SSL certificate:
@@ -320,6 +352,7 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
             }
             LogTo(RemoteRequest, @"    challenge: no SSL client cert");
         } else {
+            _authorizer = nil;
             LogTo(RemoteRequest, @"    challenge: SSL client cert rejected");
         }
         [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
@@ -372,12 +405,13 @@ void CBLWarnUntrustedCert(NSString* host, SecTrustRef trust) {
     // The redirected request needs to be authorized again:
     if (![request valueForHTTPHeaderField: @"Authorization"]) {
         NSMutableURLRequest* nuRequest = [request mutableCopy];
-        NSString* auth;
-        if (_authorizer)
-            auth = [_authorizer authorizeURLRequest: nuRequest forRealm: nil];
-        else
-            auth = [_request valueForHTTPHeaderField: @"Authorization"];
-        [nuRequest setValue: auth forHTTPHeaderField: @"Authorization"];
+        id<CBLCustomHeadersAuthorizer> customAuth = $castIfProtocol(CBLCustomHeadersAuthorizer, _authorizer);
+        if (customAuth) {
+            [customAuth authorizeURLRequest: nuRequest];
+        } else {
+            NSString* authHeader = [_request valueForHTTPHeaderField: @"Authorization"];
+            [nuRequest setValue: authHeader forHTTPHeaderField: @"Authorization"];
+        }
         request = nuRequest;
     }
     return request;

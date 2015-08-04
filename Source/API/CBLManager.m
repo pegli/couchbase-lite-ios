@@ -536,12 +536,12 @@ static CBLManager* sInstance;
     if (keyOrPassword) {
         if ([keyOrPassword isKindOfClass: [NSString class]]) {
             realKey = [[CBLSymmetricKey alloc] initWithPassword: keyOrPassword];
-        } else if (keyOrPassword) {
+        } else {
             Assert([keyOrPassword isKindOfClass: [NSData class]]);
             realKey = [[CBLSymmetricKey alloc] initWithKeyData: keyOrPassword];
+            if (!realKey)
+                return NO;
         }
-        if (!realKey)
-            return NO;
     }
     [self.shared setValue: realKey
                   forType: @"encryptionKey"
@@ -549,6 +549,31 @@ static CBLManager* sInstance;
           inDatabaseNamed: name];
     return YES;
 }
+
+
+#if !TARGET_OS_IPHONE
+- (BOOL) encryptDatabaseNamed: (NSString*)name {
+    NSString* dir = self.directory.stringByAbbreviatingWithTildeInPath;
+    NSString* itemName = $sprintf(@"%@ database in %@", name, dir);
+    NSError* error;
+    CBLSymmetricKey* key = [[CBLSymmetricKey alloc] initWithKeychainItemNamed: itemName
+                                                                        error: &error];
+    if (!key) {
+        if (error.code == errSecItemNotFound) {
+            key = [CBLSymmetricKey new];
+            if (![key saveKeychainItemNamed: itemName])
+                return NO;
+        } else {
+            return NO;
+        }
+    }
+    [self.shared setValue: key
+                  forType: @"encryptionKey"
+                     name: @""
+          inDatabaseNamed: name];
+    return YES;
+}
+#endif
 
 
 #if DEBUG
@@ -785,7 +810,7 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     }
 
     NSURL* remote = [NSURL URLWithString: remoteDict[@"url"]];
-    if (![@[@"http", @"https", @"cbl"] containsObject: remote.scheme.lowercaseString])
+    if (![@[@"http", @"https", @"cbl", @"ws", @"wss"] containsObject: remote.scheme.lowercaseString])
         return kCBLStatusBadRequest;
     if (outDatabase) {
         *outDatabase = db;
@@ -863,39 +888,15 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     // Extract the parameters from the JSON request body:
     // http://wiki.apache.org/couchdb/Replication
     CBLDatabase* db;
-    NSURL* remote;
-    BOOL push, createTarget;
-    NSDictionary* headers;
-    id<CBLAuthorizer> authorizer;
-
-    CBLStatus status = [self parseReplicatorProperties: properties
-                                            toDatabase: &db remote: &remote
-                                                isPush: &push
-                                          createTarget: &createTarget
-                                               headers: &headers
-                                            authorizer: &authorizer];
+    CBLStatus status;
+    CBL_ReplicatorSettings* settings = [self replicatorSettingsWithProperties: properties
+                                                                   toDatabase: &db
+                                                                       status: &status];
     if (CBLStatusIsError(status)) {
         if (outStatus)
             *outStatus = status;
         return nil;
     }
-
-    NSString* filterName = $castIf(NSString, properties[@"filter"]);
-    NSArray* docIDs = $castIf(NSArray, properties[@"doc_ids"]);
-
-    CBL_ReplicatorSettings* settings = [[CBL_ReplicatorSettings alloc] initWithRemote: remote
-                                                                                 push: push];
-    settings.continuous = [$castIf(NSNumber, properties[@"continuous"]) boolValue];
-    settings.filterName = filterName;
-    settings.filterParameters = $castIf(NSDictionary, properties[@"query_params"]);
-    settings.docIDs = docIDs;
-    settings.options = properties;
-    settings.requestHeaders = headers;
-    settings.authorizer = authorizer;
-    settings.createTarget = push && createTarget;
-
-    if (![settings compilePushFilterForDatabase: db status: outStatus])
-        return nil;
 
     id<CBL_Replicator> repl = [[self.replicatorClass alloc] initWithDB: db settings: settings];
     if (!repl) {
@@ -912,6 +913,54 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     if (outStatus)
         *outStatus = kCBLStatusOK;
     return repl;
+}
+
+
+- (CBL_ReplicatorSettings*) replicatorSettingsWithProperties: (NSDictionary*)properties
+                                                  toDatabase: (CBLDatabase**)outDatabase
+                                                      status: (CBLStatus*)outStatus {
+    // Extract the parameters from the JSON request body:
+    // http://wiki.apache.org/couchdb/Replication
+    NSURL* remote;
+    BOOL push, createTarget;
+    NSDictionary* headers;
+    id<CBLAuthorizer> authorizer;
+    CBLDatabase* database;
+
+    CBLStatus status = [self parseReplicatorProperties: properties
+                                            toDatabase: &database
+                                                remote: &remote
+                                                isPush: &push
+                                          createTarget: &createTarget
+                                               headers: &headers
+                                            authorizer: &authorizer];
+    if (outStatus)
+        *outStatus = status;
+
+    if (CBLStatusIsError(status))
+        return nil;
+
+    NSString* filterName = $castIf(NSString, properties[@"filter"]);
+    NSArray* docIDs = $castIf(NSArray, properties[@"doc_ids"]);
+
+    CBL_ReplicatorSettings* settings = [[CBL_ReplicatorSettings alloc] initWithRemote: remote
+                                                                                 push: push];
+    settings.continuous = [$castIf(NSNumber, properties[@"continuous"]) boolValue];
+    settings.filterName = filterName;
+    settings.filterParameters = $castIf(NSDictionary, properties[@"query_params"]);
+    settings.docIDs = docIDs;
+    settings.options = properties;
+    settings.requestHeaders = headers;
+    settings.authorizer = authorizer;
+    settings.createTarget = push && createTarget;
+
+    if (![settings compilePushFilterForDatabase: database status: outStatus])
+        return nil;
+
+    if (outDatabase)
+        *outDatabase = database;
+
+    return settings;
 }
 
 

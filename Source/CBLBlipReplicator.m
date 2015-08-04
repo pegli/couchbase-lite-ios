@@ -9,7 +9,6 @@
 #import "CBLBlipReplicator.h"
 #import "CBLSyncConnection.h"
 #import "CBLAuthorizer.h"
-#import "CBLClientCertAuthorizer.h"
 #import "CouchbaseLitePrivate.h"
 #import "CBLReachability.h"
 #import "CBLMisc.h"
@@ -60,6 +59,7 @@
 @synthesize sync=_sync, status=_status;
 @synthesize changesProcessed=_changesProcessed, changesTotal=_changesTotal;
 @synthesize remoteCheckpointDocID=_remoteCheckpointDocID;
+@synthesize lastSequence=_lastSequence;
 
 
 + (BOOL) needsRunLoop {
@@ -137,20 +137,8 @@
 }
 
 
-- (NSSet*) pendingDocIDs {
-    CBLQueryEnumerator* e = _sync.pendingDocuments;
-    if (!e)
-        return nil;
-    NSMutableSet* docIDs = [NSMutableSet new];
-    for (CBLQueryRow* row in e) {
-        [docIDs addObject: row.documentID];
-    }
-    return docIDs;
-}
-
-
 #if DEBUG
-@synthesize savingCheckpoint=_savingCheckpoint, active=_active, lastSequence=_lastSequence;
+@synthesize savingCheckpoint=_savingCheckpoint, active=_active;
 #endif
 
 
@@ -170,16 +158,10 @@
     }];
     [self.cookieStorage addCookieHeaderToRequest: request];
 
-    NSURLCredential* credential = nil;
     id<CBLAuthorizer> auth = _settings.authorizer;
-    if ([auth isKindOfClass: [CBLBasicAuthorizer class]]) {
-        credential = ((CBLBasicAuthorizer*)auth).credential; // password credential
-    } else if ([auth isKindOfClass: [CBLClientCertAuthorizer class]]) {
-        credential = ((CBLClientCertAuthorizer*)auth).credential; // client-cert credential
-    } else {
-        [request setValue: [auth authorizeURLRequest: request forRealm: nil]
-                 forHTTPHeaderField: @"Authorization"];
-    }
+    NSURLCredential* credential = $castIfProtocol(CBLCredentialAuthorizer, auth).credential;
+    if (!credential)
+        [$castIfProtocol(CBLCustomHeadersAuthorizer, auth) authorizeURLRequest: request];
 
     _conn = [[BLIPPocketSocketConnection alloc] initWithURLRequest: request];
     _conn.credential = credential;
@@ -293,8 +275,8 @@
                                 userInfo: error.userInfo];
     }
     if (!$equal(error, _error)) {
-        LogTo(Sync, @"Connection got error %@ [%@ %ld]",
-              error.localizedDescription, error.domain, (long)error.code);
+        LogTo(Sync, @"%@: Connection got error %@ [%@ %ld]",
+              self, error.localizedDescription, error.domain, (long)error.code);
         self.error = error;
     }
 }
@@ -328,7 +310,9 @@
             newStatus = kCBLReplicatorIdle;
             if (!_settings.continuous) {
                 LogTo(Sync, @"%@: SyncHandler went idle; closing connection...", self);
-                newStatus = kCBLReplicatorStopped;
+                // Keep the previous status. After the sync connection is closed,
+                // the status will be updated to kCBLReplicatorStopped:
+                newStatus = self.status;
                 [_sync close];
             }
             break;

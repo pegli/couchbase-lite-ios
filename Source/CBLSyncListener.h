@@ -6,14 +6,12 @@
 //  Copyright (c) 2015 Couchbase. All rights reserved.
 //
 
-#import "BLIPPocketSocketListener.h"
-
-@class CBLDatabase;
+#import "CBLListener.h"
 
 
-@interface CBLSyncListener : BLIPPocketSocketListener
+/** Listener/server for new replication protocol. */
+@interface CBLSyncListener : CBLListener
 
-- (instancetype) initWithDatabase: (CBLDatabase*)db
-                             path: (NSString*)path;
+@property (readonly) NSUInteger connectionCount;
 
 @end

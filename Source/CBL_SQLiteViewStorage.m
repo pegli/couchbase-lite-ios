@@ -152,12 +152,20 @@
         Warn(@"Can't index full text: SQLite isn't built with FTS3 or FTS4 module");
         return NO;
     }
-    NSString* sql = @"\
-        CREATE VIRTUAL TABLE IF NOT EXISTS fulltext USING fts4(content, tokenize=unicodesn);\
+
+    // Derive the stemmer language name based on the current locale's language.
+    NSString* stemmerName = CBLStemmerNameForCurrentLocale();
+    NSString* stemmer = @"";
+    if (stemmerName)
+        stemmer = $sprintf(@"\"stemmer=%@\"", stemmerName);
+
+    NSString* sql = $sprintf(@"\
+        CREATE VIRTUAL TABLE IF NOT EXISTS fulltext \
+            USING fts4(content, tokenize=unicodesn %@);\
         CREATE INDEX IF NOT EXISTS  'maps_#_by_fulltext' ON 'maps_#'(fulltext_id); \
         CREATE TRIGGER IF NOT EXISTS 'del_maps_#_fulltext' \
             DELETE ON 'maps_#' WHEN old.fulltext_id not null BEGIN \
-                DELETE FROM fulltext WHERE rowid=old.fulltext_id| END";
+                DELETE FROM fulltext WHERE rowid=old.fulltext_id| END", stemmer);
     //OPT: Would be nice to use partial indexes but that requires SQLite 3.8 and makes
     // the db file only readable by SQLite 3.8+, i.e. the file would not be portable to
     // iOS 8 which only has SQLite 3.7 :(
@@ -399,7 +407,14 @@
                 NSString* docType = checkDocTypes ? [r stringForColumnIndex: 6] : nil;
 
                 // Skip rows with the same doc_id -- these are losing conflicts.
+                NSMutableArray* conflicts = nil;
                 while ((keepGoing = [r next]) && [r longLongIntForColumnIndex: 0] == doc_id) {
+                    if (!deleted) {
+                        // Conflict revisions:
+                        if (!conflicts)
+                            conflicts = $marray();
+                        [conflicts addObject: [r stringForColumnIndex: 3]];
+                    }
                 }
 
                 SequenceNumber realSequence = sequence; // because sequence may be changed, below
@@ -408,8 +423,7 @@
                     CBL_FMResultSet* r2 = [fmdb executeQuery:
                                     @"SELECT revid, sequence FROM revs "
                                      "WHERE doc_id=? AND sequence<=? AND current!=0 AND deleted=0 "
-                                     "ORDER BY revID DESC "
-                                     "LIMIT 1",
+                                     "ORDER BY revID DESC",
                                     @(doc_id), @(minLastSequence)];
                     if (!r2) {
                         [r close];
@@ -437,6 +451,14 @@
                             json = [fmdb dataForQuery: @"SELECT json FROM revs WHERE sequence=?",
                                     @(sequence)];
                         }
+                        if (!deleted) {
+                            // Conflict revisions:
+                            if (!conflicts)
+                                conflicts = $marray();
+                            [conflicts addObject: oldRevID];
+                            while ([r2 next])
+                                [conflicts addObject: [r2 stringForColumnIndex:0]];
+                        }
                     }
                     [r2 close];
                 }
@@ -454,6 +476,9 @@
                     continue;
                 }
                 curDoc[@"_local_seq"] = @(sequence);
+
+                if (conflicts)
+                    curDoc[@"_conflicts"] = conflicts;
 
                 // Call the user-defined map() to emit new key/value pairs from this revision:
                 int i = -1;
@@ -857,7 +882,10 @@ typedef CBLStatus (^QueryRowBlock)(NSData* keyData, NSData* valueData, NSString*
                                                 options.fullTextQuery,
                                                 @(limit), @(options->skip)];
     if (!r) {
-        *outStatus = dbStorage.lastDbError;
+        if (dbStorage.fmdb.lastErrorCode == SQLITE_ERROR)
+            *outStatus = kCBLStatusBadRequest;      // SQLITE_ERROR means invalid FTS query string
+        else
+            *outStatus = dbStorage.lastDbError;
         return nil;
     }
     NSMutableArray* rows = [[NSMutableArray alloc] init];

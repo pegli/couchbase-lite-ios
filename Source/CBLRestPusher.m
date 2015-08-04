@@ -75,36 +75,14 @@
 
 
 - (CBL_RevisionList*) unpushedRevisions {
-    CBLDatabase* db = _db;
-    CBLFilterBlock filter = _settings.filterBlock;
-
-    NSString* lastSequence = _lastSequence;
-    if (!lastSequence) {
-        // If replicator hasn't started yet (can happen if this method is being called from a
-        // CBLReplication), get local checkpoint from db:
-        NSString* checkpointID = self.remoteCheckpointDocID;
-        lastSequence = [db lastSequenceWithCheckpointID: checkpointID];
-    }
-
-    // Include conflicts so all conflicting revisions are replicated too
-    CBLChangesOptions options = kDefaultCBLChangesOptions;
-    options.includeConflicts = YES;
-
-    CBLStatus status;
-    CBL_RevisionList* revs = [db changesSinceSequence: [lastSequence longLongValue]
-                                              options: &options
-                                               filter: filter
-                                               params: _settings.filterParameters
-                                               status: &status];
+    NSError *error;
+    CBL_RevisionList* revs = [_db unpushedRevisionsSince: _lastSequence
+                                                  filter: _settings.filterBlock
+                                                  params: _settings.filterParameters
+                                                   error: &error];
     if (!revs)
-        self.error = CBLStatusToNSError(status);
+        self.error = error;
     return revs;
-}
-
-- (NSSet*) pendingDocIDs {
-    CBL_RevisionList* revs = self.unpushedRevisions;
-    return revs ? [NSSet setWithArray: revs.allDocIDs] : nil;
-
 }
 
 
@@ -405,7 +383,9 @@ CBLStatus CBLStatusFromBulkDocsResponseItem(NSDictionary* item) {
         return kCBLStatusUpstreamError;
 }
 
-- (CBLMultipartWriter*)multipartWriterForRevision: (CBL_Revision*)rev {
+- (CBLMultipartWriter*)multipartWriterForRevision: (CBL_Revision*)rev
+                                         boundary: (NSString*)boundary
+{
     // Find all the attachments with "follows" instead of a body, and put 'em in a multipart stream.
     // It's important to scan the _attachments entries in the same order in which they will appear
     // in the JSON, because CouchDB expects the MIME bodies to appear in that same order (see #133).
@@ -417,7 +397,7 @@ CBLStatus CBLStatusFromBulkDocsResponseItem(NSDictionary* item) {
             if (!bodyStream) {
                 // Create the HTTP multipart stream:
                 bodyStream = [[CBLMultipartWriter alloc] initWithContentType: @"multipart/related"
-                                                                    boundary: nil];
+                                                                    boundary: boundary];
                 [bodyStream setNextPartsHeaders: @{@"Content-Type": @"application/json"}];
                 // Use canonical JSON encoder so that _attachments keys will be written in the
                 // same order that this for loop is processing the attachments.
@@ -456,9 +436,10 @@ CBLStatus CBLStatusFromBulkDocsResponseItem(NSDictionary* item) {
 
 - (BOOL) uploadMultipartRevision: (CBL_Revision*)rev {
     // Pre-creating the body stream and check if it's available or not.
-    __block CBLMultipartWriter* bodyStream = [self multipartWriterForRevision: rev];
+    __block CBLMultipartWriter* bodyStream = [self multipartWriterForRevision: rev boundary: nil];
     if (!bodyStream)
         return NO;
+    NSString* boundary = bodyStream.boundary;
     
     // OK, we are going to upload this on its own:
     self.changesTotal++;
@@ -471,10 +452,13 @@ CBLStatus CBLStatusFromBulkDocsResponseItem(NSDictionary* item) {
                               multipartWriter:^CBLMultipartWriter *{
                                   CBLMultipartWriter* writer = bodyStream;
                                   // Reset to nil so the writer will get regenerated if the block
-                                  // gets re-called (e.g. when retrying).
+                                  // gets re-called (e.g. when retrying). Make sure to use the same
+                                  // multipart boundary string: it's already been encoded in the
+                                  // Content-Type header so it has to match in the body!
                                   bodyStream = nil;
                                   if (!writer)
-                                      writer = [self multipartWriterForRevision: rev];
+                                      writer = [self multipartWriterForRevision: rev
+                                                                       boundary: boundary];
                                   return writer;
                               }
                                  onCompletion: ^(CBLMultipartUploader* result, NSError *error) {

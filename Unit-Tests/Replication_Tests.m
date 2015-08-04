@@ -42,6 +42,7 @@
     NSUInteger _expectedChangesCount;
     NSArray* _changedCookies;
     BOOL _newReplicator;
+    NSTimeInterval _timeout;
 }
 
 
@@ -64,6 +65,7 @@
         dbmgr.replicatorClassName = @"CBLBlipReplicator";
         dbmgr.dispatchQueue = dispatch_get_main_queue();
     }
+    _timeout = 15.0;
 }
 
 
@@ -79,7 +81,8 @@
 
     bool started = false, done = false;
     [repl start];
-    CFAbsoluteTime lastTime = 0;
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime lastTime = startTime;
     while (!done) {
         if (![[NSRunLoop currentRunLoop] runMode: NSDefaultRunLoopMode
                                       beforeDate: [NSDate dateWithTimeIntervalSinceNow: 0.1]])
@@ -93,9 +96,13 @@
         // Replication runs on a background thread, so the main runloop should not be blocked.
         // Make sure it's spinning in a timely manner:
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (lastTime > 0 && now-lastTime > 0.25)
+        if (now-lastTime > 0.25)
             Warn(@"Runloop was blocked for %g sec", now-lastTime);
         lastTime = now;
+        if (now-startTime > _timeout) {
+            XCTFail(@"...replication took too long (%.3f sec)", now-startTime);
+            return;
+        }
     }
     Log(@"...replicator finished. mode=%u, progress %u/%u, error=%@",
         repl.status, repl.completedChangesCount, repl.changesCount, repl.lastError);
@@ -124,14 +131,14 @@
                                                     name: CBLCookieStorageCookiesChangedNotification
                                                   object: nil];
 
-    Assert (expectedChangedCookies.count == _changedCookies.count);
+    AssertEq(expectedChangedCookies.count, _changedCookies.count);
     for (NSHTTPCookie* cookie in expectedChangedCookies)
         Assert([_changedCookies containsObject: cookie]);
 }
 
 
 - (void) replChanged: (NSNotification*)n {
-    Assert(n.object == _currentReplication, @"Wrong replication given to notification");
+    AssertEq(n.object, _currentReplication, @"Wrong replication given to notification");
     Log(@"Replication status=%u; completedChangesCount=%u; changesCount=%u",
         _currentReplication.status, _currentReplication.completedChangesCount, _currentReplication.changesCount);
     if (!_newReplicator) {
@@ -151,6 +158,7 @@
 - (void) cookiesChanged: (NSNotification*)n {
     CBLCookieStorage* storage = n.object;
     _changedCookies = storage.cookies;
+    Log(@"%@ changed: %lu cookies", storage, (unsigned long)_changedCookies.count);
 }
 
 
@@ -219,7 +227,7 @@
     NSError* error;
     __unused CBLSavedRevision *rev1 = [doc putProperties: @{@"dynamic":@1} error: &error];
     
-    Assert(!error);
+    AssertNil(error);
 
     unsigned char attachbytes[kAttSize];
     for(int i=0; i<kAttSize; i++) {
@@ -233,7 +241,7 @@
     
     [rev2 save:&error];
     
-    Assert(!error);
+    AssertNil(error);
     
     AssertEq(rev2.attachments.count, (NSUInteger)1);
     AssertEqual(rev2.attachmentNames, [NSArray arrayWithObject: @"attach"]);
@@ -260,7 +268,7 @@
     // save the updated document
     [doc putProperties: contents error: &error];
     
-    Assert(!error);
+    AssertNil(error);
     
     Log(@"Pushing 2...");
     repl = [db createPushReplication: remoteDbURL];
@@ -645,7 +653,6 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
 
     [repl deleteCookieNamed: cookie2.name];
 
-    [repl start];
     [self runReplication: repl expectedChangesCount: 0 expectedChangedCookies: @[cookie1, cookie3]];
     AssertNil(repl.lastError);
 
@@ -1064,10 +1071,107 @@ static UInt8 sEncryptionIV[kCCBlockSizeAES128];
                                  return pusher.status == kCBLReplicationStopped;
                              }];
     [self waitForExpectationsWithTimeout: 5.0 handler: nil];
-    Assert(!pusher.lastError);
-    Assert(pusher.completedChangesCount == 0);
-    Assert(pusher.changesCount == 0);
+    AssertNil(pusher.lastError);
+    AssertEq(pusher.completedChangesCount, 0u);
+    AssertEq(pusher.changesCount, 0u);
     Assert(![pusher isDocumentPending: doc]);
 }
+
+
+- (void)test18_PendingDocumentIDs {
+    NSURL* remoteDbURL = [self remoteTestDBURL: kPushThenPullDBName];
+    if (!remoteDbURL)
+        return;
+    [self eraseRemoteDB: remoteDbURL];
+
+    // Push replication:
+    CBLReplication* repl = [db createPushReplication: remoteDbURL];
+    Assert(repl.pendingDocumentIDs != nil);
+    AssertEq(repl.pendingDocumentIDs.count, 0u);
+
+    [db inTransaction: ^BOOL{
+        for (int i = 1; i <= 10; i++) {
+            @autoreleasepool {
+                CBLDocument* doc = db[ $sprintf(@"doc-%d", i) ];
+                NSError* error;
+                [doc putProperties: @{@"index": @(i), @"bar": $false} error: &error];
+                AssertNil(error);
+            }
+        }
+        return YES;
+    }];
+
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [repl start];
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [self runReplication: repl expectedChangesCount: 10u];
+    Assert(repl.pendingDocumentIDs != nil);
+    AssertEq(repl.pendingDocumentIDs.count, 0u);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    // Add another set of documents and create a new replicator:
+    [db inTransaction: ^BOOL{
+        for (int i = 11; i <= 20; i++) {
+            @autoreleasepool {
+                CBLDocument* doc = db[ $sprintf(@"doc-%d", i) ];
+                NSError* error;
+                [doc putProperties: @{@"index": @(i), @"bar": $false} error: &error];
+                AssertNil(error);
+            }
+        }
+        return YES;
+    }];
+
+    repl = [db createPushReplication: remoteDbURL];
+
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-11"]]);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    [repl start];
+    AssertEq(repl.pendingDocumentIDs.count, 10u);
+    Assert([repl isDocumentPending: [db documentWithID: @"doc-11"]]);
+    Assert(![repl isDocumentPending: [db documentWithID: @"doc-1"]]);
+
+    // Pull replication:
+    repl = [db createPullReplication: remoteDbURL];
+    Assert(repl.pendingDocumentIDs == nil);
+
+    // Start and recheck:
+    [repl start];
+    Assert(repl.pendingDocumentIDs == nil);
+
+    [self runReplication: repl expectedChangesCount: 0u];
+    Assert(repl.pendingDocumentIDs == nil);
+}
+
+
+- (void) test_19_Auth_Failure {
+    _timeout = 2.0; // Failure should be immediate, with no retries
+    NSURL* remoteDbURL = [self remoteTestDBURL: @"cbl_auth_test"];
+    if (!remoteDbURL)
+        return;
+
+    CBLReplication* repl = [db createPullReplication: remoteDbURL];
+    repl.authenticator = [CBLAuthenticator basicAuthenticatorWithName: @"wrong"
+                                                             password: @"wrong"];
+    [self runReplication: repl expectedChangesCount: 0];
+    AssertEqual(repl.lastError.domain, CBLHTTPErrorDomain);
+    AssertEq(repl.lastError.code, 401);
+
+    repl.authenticator = [CBLAuthenticator OAuth1AuthenticatorWithConsumerKey: @"wrong"
+                                                               consumerSecret: @"wrong"
+                                                                        token: @"wrong"
+                                                                  tokenSecret: @"wrong"
+                                                              signatureMethod: @"PLAINTEXT"];
+    [self runReplication: repl expectedChangesCount: 0];
+    AssertEqual(repl.lastError.domain, CBLHTTPErrorDomain);
+    AssertEq(repl.lastError.code, 401);
+}
+
 
 @end

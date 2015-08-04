@@ -15,12 +15,8 @@
 
 #define TEST_NON_INVERSE_RELATIONSHIP 0
 
-@interface CBLIncrementalStore (Internal)
-- (void) stop;
-@end
 
-
-@interface IncrementalStore_Tests : CBLTestCaseWithDB
+@interface IncrementalStore_Tests : CBLTestCaseWithDB <CBLIncrementalStoreDelegate>
 @end
 
 
@@ -160,7 +156,6 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
 }
 
 - (void) tearDown {
-    [store stop];
     [super tearDown];
 }
 
@@ -296,13 +291,15 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
     AssertEqual(file.data, attachment.content);
     
     // now change the properties in CouchbaseLite and check if those are available in Core Data
+    __block NSUInteger count = 0;
     XCTestExpectation *expectation = [self expectationWithDescription:@"CBLIS Changed Notification"];
     id observer = [[NSNotificationCenter defaultCenter]
                    addObserverForName: kCBLISObjectHasBeenChangedInStoreNotification
                                object: store
                                 queue: nil
                            usingBlock:^(NSNotification *note) {
-        [expectation fulfill];
+        if (++count == 2)
+            [expectation fulfill];
     }];
 
     [entryProperties setObject:@"different text" forKey:@"text"];
@@ -319,8 +316,6 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
     
     entry = (Entry*)[context existingObjectWithID:entryID error:&error];
     Assert(entry != nil, @"Couldn load entry: %@", error);
-    
-    // if one of the following fails, make sure you compiled the CBLIncrementalStore with CBLIS_NO_CHANGE_COALESCING=1
     AssertEqual(entry.text, [entryProperties objectForKey:@"text"]);
     AssertEqual(entry.check, [entryProperties objectForKey:@"check"]);
     AssertEqual(entry.number, [entryProperties objectForKey:@"number"]);
@@ -589,7 +584,12 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
     entry.text = @"Test2";
     success = [context save:&error];
     Assert(success, @"Could not save context: %@", error);
-    
+
+    result = [context executeFetchRequest:fetchRequest error:&error];
+    AssertEq(result.count, 2u);
+    Assert([result[0] isKindOfClass:[NSManagedObject class]], @"Results are not NSManagedObjects");
+    Assert([result[1] isKindOfClass:[NSManagedObject class]], @"Results are not NSManagedObjects");
+
     fetchRequest.predicate = [NSPredicate predicateWithFormat:@"text == 'Test2'"];
     fetchRequest.resultType = NSCountResultType;
     result = [context executeFetchRequest:fetchRequest error:&error];
@@ -1437,6 +1437,12 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
         AssertEq((int)result.count, 3);
     }];
 
+    // Deep Many with an object id
+    fetchRequest.predicate = [NSPredicate predicateWithFormat:@"entry.user == %@", [user1 objectID]];
+    [self assertFetchRequest: fetchRequest block: ^(NSArray *result, NSFetchRequestResultType resultType) {
+        AssertEq((int)result.count, 3);
+    }];
+
     fetchRequest.predicate = [NSCompoundPredicate andPredicateWithSubpredicates:@[[NSPredicate predicateWithFormat:@"entry == %@", entry1], [NSPredicate predicateWithFormat:@"number == 10"]]];
     [self assertFetchRequest: fetchRequest block: ^(NSArray *result, NSFetchRequestResultType resultType) {
         AssertEq((int)result.count, 1);
@@ -1576,7 +1582,6 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
         AssertEqual (texts, expected);
     }];
 }
-
 
 - (void)test_FetchWithRelationshipNil {
     NSError *error;
@@ -1856,6 +1861,52 @@ static NSArray *CBLISTestInsertEntriesWithProperties(NSManagedObjectContext *con
     AssertEqual(props[@"text"], @"test");
     AssertEqual(props[@"check"], @(YES));
     AssertEqual(props[@"created_at"], date);
+}
+
+- (void)test_StoreWillSaveDocument {
+    NSError *error;
+    Entry *entry1 = [NSEntityDescription insertNewObjectForEntityForName:@"Entry"
+                                                 inManagedObjectContext:context];
+    Assert([context save:&error]);
+    
+    CBLDocument *doc1 = [store.database documentWithID:[entry1.objectID couchbaseLiteIDRepresentation]];
+    AssertNil([doc1 propertyForKey:@"code"]);
+    
+    // Set delegate:
+    store.delegate = self;
+    
+    // Update entry1 and create entry2 and user1:
+    entry1.text = @"entry1";
+    Entry *entry2 = [NSEntityDescription insertNewObjectForEntityForName:@"Entry"
+                                                  inManagedObjectContext:context];
+    User *user1 = [NSEntityDescription insertNewObjectForEntityForName:@"User"
+                                                inManagedObjectContext:context];
+    Assert([context save:&error]);
+    
+    CBLDocument *doc2 = [store.database documentWithID:[entry2.objectID couchbaseLiteIDRepresentation]];
+    CBLDocument *doc3 = [store.database documentWithID:[user1.objectID couchbaseLiteIDRepresentation]];
+    
+    AssertEqual([doc1 propertyForKey:@"code"], @"1234");
+    AssertEqual([doc2 propertyForKey:@"code"], @"1234");
+    AssertNil([doc3 propertyForKey:@"code"]);
+    
+    // Delete (ensure no error):
+    [context deleteObject: entry2];
+    Assert([context save:&error]);
+    
+    // Reset delegate:
+    store.delegate = nil;
+}
+
+#pragma mark - CBLIncrementalStoreDelegate
+
+- (NSDictionary *)storeWillSaveDocument:(NSDictionary *)props {
+    if ([props[@"type"] isEqualToString:@"Entry"]) {
+        NSMutableDictionary* newProps = [props mutableCopy];
+        newProps[@"code"] = @"1234";
+        return newProps;
+    }
+    return props;
 }
 
 #pragma mark - UTILITIES

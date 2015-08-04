@@ -40,15 +40,18 @@ typedef struct CBLManagerOptions {
     @param directory  Path to data directory. If it doesn't already exist it will be created.
     @param options  If non-NULL, a pointer to options (read-only and no-replicator).
     @param outError  On return, the error if any. */
-- (instancetype) initWithDirectory: (NSString*)directory
-                           options: (const CBLManagerOptions* __nullable)options
-                             error: (NSError**)outError;
+- (nullable instancetype) initWithDirectory: (NSString*)directory
+                                    options: (const CBLManagerOptions* __nullable)options
+                                      error: (NSError**)outError;
 
 /** Creates a copy of this CBLManager, which can be used on a different thread. */
 - (instancetype) copy;
 
 /** Releases all resources used by the CBLManager instance and closes all its databases. */
 - (void) close;
+
+/** Storage engine type. There are two options, "SQLite" (default) or "ForestDB". */
+@property (copy, nonatomic) NSString* storageType;
 
 /** The root directory of this manager (as specified at initialization time.) */
 @property (readonly) NSString* directory;
@@ -82,6 +85,20 @@ typedef struct CBLManagerOptions {
     regular SQLite. Otherwise opening the database will fail with an error. */
 - (BOOL) registerEncryptionKey: (nullable id)encryptionKey
               forDatabaseNamed: (NSString*)name;
+
+#if !TARGET_OS_IPHONE
+/** Encrypts a database using a randomly-generated key that's stored in the default Keychain.
+    This must be called before opening an encrypted database, or before creating a database
+    that's to be encrypted.
+ 
+    (The effect is similar to -registerEncryptionKey:forDatabaseNamed:, except that storage of
+    the key is taken care of automatically.)
+
+    For security reasons this method is not available on iOS. Instead, consider using
+    CBLEncryptionController (found in the Extras folder of the distribution) as a high level
+    interface for managing database encryption using a user-supplied password or TouchID. */
+- (BOOL) encryptDatabaseNamed: (NSString*)name;
+#endif
 
 /** Same as -existingDatabaseNamed:. Enables "[]" access in Xcode 4.4+ */
 - (nullable CBLDatabase*) objectForKeyedSubscript: (NSString*)key;
